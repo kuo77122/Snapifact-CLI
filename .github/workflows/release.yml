@@ -13,13 +13,13 @@ jobs:
     name: Verify (ubuntu-latest)
     runs-on: ubuntu-latest
     outputs:
-      canonical_tag: ${{ steps.tag-contract.outputs.canonical_tag }}
+      canonical_tag: ${{ steps.tag_contract.outputs.canonical_tag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - id: tag-contract
+      - id: tag_contract
         name: Check canonical tag boundary
         shell: bash
         run: |
