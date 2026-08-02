@@ -24,7 +24,7 @@ require "$workflow" 'canonical_tag:'
 require "$workflow" 'canonical_tag=true'
 require "$workflow" 'pull_request:'
 require "$workflow" 'push:'
-require "$workflow" "tags: ['v*']"
+require "$workflow" 'refs/tags/v(0|[1-9][0-9]*)'
 require "$workflow" 'needs: verify'
 require "$workflow" "needs.verify.outputs.canonical_tag == 'true'"
 require "$workflow" 'github.event_name == '\''push'\'''
