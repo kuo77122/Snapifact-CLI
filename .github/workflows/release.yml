@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (ubuntu-latest)
+    runs-on: ubuntu-latest
+    outputs:
+      canonical_tag: ${{ steps.tag-contract.outputs.canonical_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - id: tag-contract
+        name: Check canonical tag boundary
+        shell: bash
+        run: |
+          canonical_tag=false
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" =~ ^refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && "$GITHUB_REF" == "refs/tags/$GITHUB_REF_NAME" ]]; then
+            canonical_tag=true
+          fi
+          printf 'canonical_tag=%s\n' "$canonical_tag" >> "$GITHUB_OUTPUT"
+      - run: go test ./...
+      - run: go vet ./...
+      - run: ./scripts/build-release.sh test
+      - run: ./scripts/test-installer.sh
+      - run: ./scripts/test-installer-startup.sh
+      - run: ./scripts/test-release-workflow.sh
+
+  publish:
+    name: Publish draft release
+    if: github.event_name == 'push' && needs.verify.result == 'success' && needs.verify.outputs.canonical_tag == 'true'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Refuse an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && { echo "release already exists: $GITHUB_REF_NAME" >&2; exit 1; } || test "$?" = 1
+      - name: Prove immutable tag binding
+        run: |
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+      - name: Build and validate release assets
+        run: ./scripts/build-release.sh "$GITHUB_REF_NAME"
+      - name: Create one draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft
+          --title "$GITHUB_REF_NAME" --notes "Draft release for $GITHUB_REF_NAME"
+          dist/snapifact_linux_amd64 dist/snapifact_linux_arm64
+          dist/snapifact_darwin_amd64 dist/snapifact_darwin_arm64
+          dist/SHA256SUMS dist/install.sh
+      - name: Download and revalidate exact draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          gh release download "$GITHUB_REF_NAME" --dir "$verify_dir" --clobber
+          ./scripts/validate-release.sh "$verify_dir"
