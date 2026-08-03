@@ -3,6 +3,12 @@ name: Release
 on:
   pull_request:
   push:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Canonical release tag to rehearse in preview
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,10 +20,14 @@ jobs:
     outputs:
       canonical_tag: ${{ steps.tag_contract.outputs.canonical_tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.4.0
+          cache: npm
       - id: tag_contract
         name: Check canonical tag boundary
         shell: bash
@@ -27,6 +37,12 @@ jobs:
             canonical_tag=true
           fi
           printf 'canonical_tag=%s\n' "$canonical_tag" >> "$GITHUB_OUTPUT"
+      - name: Install publication dependencies
+        run: npm ci
+      - name: Test R2 publication helper
+        run: npm run test:r2
+      - name: Test release workflow policy
+        run: npm run test:workflow
       - run: go test ./...
       - run: go vet ./...
       - run: ./scripts/build-release.sh test
@@ -36,24 +52,27 @@ jobs:
 
   publish:
     name: Publish draft release
-    if: github.event_name == 'push' && needs.verify.result == 'success' && needs.verify.outputs.canonical_tag == 'true'
+    if: ${{ github.event_name == 'push' && needs.verify.result == 'success' && needs.verify.outputs.canonical_tag == 'true' }}
     needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
       - name: Refuse an existing release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && { echo "release already exists: $GITHUB_REF_NAME" >&2; exit 1; } || test "$?" = 1
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && {
+            echo "release already exists: $GITHUB_REF_NAME" >&2
+            exit 1
+          } || test "$?" = 1
       - name: Prove immutable tag binding
         run: |
           test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
@@ -65,7 +84,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft
           --title "$GITHUB_REF_NAME" --notes "Draft release for $GITHUB_REF_NAME"
           dist/snapifact_linux_amd64 dist/snapifact_linux_arm64
           dist/snapifact_darwin_amd64 dist/snapifact_darwin_arm64
@@ -74,7 +93,160 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          verify_dir=$(mktemp -d)
+          verify_dir=$(mktemp -d "$RUNNER_TEMP/release-assets.XXXXXX")
           trap 'rm -rf "$verify_dir"' EXIT
-          gh release download "$GITHUB_REF_NAME" --dir "$verify_dir" --clobber
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir" --clobber
           ./scripts/validate-release.sh "$verify_dir"
+
+  preflight:
+    name: Preflight preview release provenance
+    needs: verify
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag_sha: ${{ steps.provenance.outputs.tag_sha }}
+      digest_set: ${{ steps.digests.outputs.digest_set }}
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate canonical release version
+        shell: bash
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.4.0
+          cache: npm
+      - name: Install publication dependencies
+        run: npm ci
+      - id: provenance
+        name: Prove canonical tag and exact draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION")
+          tag_type=$(jq -r '.object.type' <<<"$tag_ref")
+          tag_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+          if [[ "$tag_type" == tag ]]; then
+            tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
+          fi
+          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
+          release_json=$(gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft,assets)
+          [[ "$(jq -r '.isDraft' <<<"$release_json")" == true ]]
+          expected=$'SHA256SUMS\ninstall.sh\nsnapifact_darwin_amd64\nsnapifact_darwin_arm64\nsnapifact_linux_amd64\nsnapifact_linux_arm64'
+          actual=$(jq -r '.assets[].name' <<<"$release_json" | sort)
+          [[ "$actual" == "$expected" ]]
+          printf 'tag_sha=%s\n' "$tag_sha" >> "$GITHUB_OUTPUT"
+      - id: digests
+        name: Validate release bytes and record sanitized digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/release-assets
+        shell: bash
+        run: |
+          mkdir -p "$RELEASE_ASSETS_DIR"
+          for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS_DIR" --pattern "$asset"
+          done
+          node --input-type=module -e '
+            import { validateAssets } from "./scripts/publish-r2.mjs"
+            await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
+          '
+          digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
+          done)
+          digest_set=${digest_set%,}
+          printf 'digest_set=%s\n' "$digest_set" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Preview release provenance\n\n- tag SHA: `%s`\n- asset digests: `%s`\n' "${{ steps.provenance.outputs.tag_sha }}" "$digest_set"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  preview-r2-rehearsal:
+    name: Rehearse R2 publication in preview
+    needs: preflight
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && needs.preflight.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: r2-release-preview
+    concurrency:
+      group: snapifact-r2-preview-publication
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      PREFLIGHT_TAG_SHA: ${{ needs.preflight.outputs.tag_sha }}
+      PREFLIGHT_DIGEST_SET: ${{ needs.preflight.outputs.digest_set }}
+    steps:
+      - name: Validate canonical release version
+        shell: bash
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.4.0
+          cache: npm
+      - name: Install publication dependencies
+        run: npm ci
+      - id: assets
+        name: Re-download and independently revalidate release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/preview-release-assets
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION")
+          tag_type=$(jq -r '.object.type' <<<"$tag_ref")
+          tag_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+          if [[ "$tag_type" == tag ]]; then
+            tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
+          fi
+          [[ "$tag_sha" == "$PREFLIGHT_TAG_SHA" ]]
+          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
+          release_json=$(gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft,assets)
+          [[ "$(jq -r '.isDraft' <<<"$release_json")" == true ]]
+          expected=$'SHA256SUMS\ninstall.sh\nsnapifact_darwin_amd64\nsnapifact_darwin_arm64\nsnapifact_linux_amd64\nsnapifact_linux_arm64'
+          actual=$(jq -r '.assets[].name' <<<"$release_json" | sort)
+          [[ "$actual" == "$expected" ]]
+          rm -rf "$RELEASE_ASSETS_DIR"
+          mkdir -p "$RELEASE_ASSETS_DIR"
+          for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS_DIR" --pattern "$asset"
+          done
+          node --input-type=module -e '
+            import { validateAssets } from "./scripts/publish-r2.mjs"
+            await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
+          '
+          digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
+          done)
+          digest_set=${digest_set%,}
+          [[ "$digest_set" == "$PREFLIGHT_DIGEST_SET" ]]
+          printf 'directory=%s\n' "$RELEASE_ASSETS_DIR" >> "$GITHUB_OUTPUT"
+      - name: Publish, verify, matching retry, rollback, and final verify
+        env:
+          SNAPIFACT_R2_ACCESS_KEY_ID: ${{ secrets.SNAPIFACT_R2_ACCESS_KEY_ID }}
+          SNAPIFACT_R2_SECRET_ACCESS_KEY: ${{ secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY }}
+          SNAPIFACT_R2_ACCOUNT_ID: ${{ vars.SNAPIFACT_R2_ACCOUNT_ID }}
+          SNAPIFACT_R2_BUCKET: ${{ vars.SNAPIFACT_R2_BUCKET }}
+          SNAPIFACT_R2_PUBLIC_ORIGIN: ${{ vars.SNAPIFACT_R2_PUBLIC_ORIGIN }}
+          RELEASE_ASSETS_DIR: ${{ steps.assets.outputs.directory }}
+        run: |
+          node scripts/publish-r2.mjs publish --version "$RELEASE_VERSION" --assets "$RELEASE_ASSETS_DIR"
+          node scripts/publish-r2.mjs verify --version "$RELEASE_VERSION"
+          node scripts/publish-r2.mjs publish --version "$RELEASE_VERSION" --assets "$RELEASE_ASSETS_DIR"
+          node scripts/publish-r2.mjs verify --version "$RELEASE_VERSION"
+          node scripts/publish-r2.mjs rollback --version "$RELEASE_VERSION"
+          node scripts/publish-r2.mjs verify --version "$RELEASE_VERSION"
