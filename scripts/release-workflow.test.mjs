@@ -20,6 +20,7 @@ const verify = jobBlock('verify')
 const publish = jobBlock('publish')
 const preflight = jobBlock('preflight')
 const preview = jobBlock('preview-r2-rehearsal')
+const backfill = jobBlock('backfill-v023')
 const assets = [
   'snapifact_linux_amd64',
   'snapifact_linux_arm64',
@@ -33,7 +34,7 @@ test('manual preview is owner-only, main-only, and checks out dispatch HEAD', ()
   assert.match(workflow, /workflow_dispatch:\n    inputs:\n      version:/)
   assert.match(
     preflight,
-    /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main' && github\.actor == github\.repository_owner \}\}/,
+    /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main' && github\.actor == github\.repository_owner && inputs\.operation == 'preview' \}\}/,
   )
   assert.match(
     preview,
@@ -51,13 +52,15 @@ test('dispatch version selects release assets and helper arguments, never implem
   assert.match(preview, /gh api "repos\/\$GITHUB_REPOSITORY\/git\/ref\/tags\/\$RELEASE_VERSION"/)
 })
 
-test('preflight proves exact draft inventory, tag SHA, installer pin, and six digests', () => {
+test('preflight proves exact artifact inventory, tag SHA, installer pin, and six digests', () => {
   assert.match(preflight, /^    needs: verify$/m)
-  assert.match(preflight, /permissions:\n      contents: read/)
+  assert.match(preflight, /permissions:\n      contents: read\n      actions: read/)
   assert.match(preflight, /jq -r '\.object\.sha'/)
   assert.match(preflight, /git\/tags\/\$tag_sha/)
-  assert.match(preflight, /\.isDraft/)
-  assert.match(preflight, /expected=\$'SHA256SUMS\\ninstall\.sh/)
+  assert.match(preflight, /actions\/workflows\/release\.yml\/runs\?event=/)
+  assert.match(preflight, /expired == false/)
+  assert.match(preflight, /artifact_digest/)
+  assert.match(preflight, /unzip -q/)
   assert.match(preflight, /await validateAssets\(process\.env\.RELEASE_ASSETS_DIR, process\.env\.RELEASE_VERSION\)/)
   assert.match(preflight, /sha256sum "\$RELEASE_ASSETS_DIR\/\$asset"/)
   assert.match(preflight, /tag_sha: \$\{\{ steps\.provenance\.outputs\.tag_sha \}\}/)
@@ -70,13 +73,16 @@ test('mutation re-downloads into a fresh directory and requires independent prov
   assert.match(preview, /^    needs: preflight$/m)
   assert.match(preview, /^    environment: r2-release-preview$/m)
   assert.match(preview, /concurrency:\n      group: snapifact-r2-preview-publication\n      cancel-in-progress: false/)
-  assert.match(preview, /permissions:\n      contents: read/)
+  assert.match(preview, /permissions:\n      contents: read\n      actions: read/)
   assert.match(preview, /rm -rf "\$RELEASE_ASSETS_DIR"/)
   assert.match(preview, /tag_sha" == "\$PREFLIGHT_TAG_SHA"/)
+  assert.match(preview, /actions\/workflows\/release\.yml\/runs\?event=/)
+  assert.match(preview, /artifact_digest/)
+  assert.match(preview, /unzip -q/)
   assert.match(preview, /digest_set" == "\$PREFLIGHT_DIGEST_SET"/)
   assert.match(preview, /printf 'directory=%s\\n'/)
   assert.match(preview, /for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install\.sh/)
-  assert.doesNotMatch(preview, /gh release download[^\n]*--dir dist/)
+  assert.doesNotMatch(preview, /gh release (view|download)/)
 })
 
 test('only the final credential-bearing step binds approved Preview values', () => {
@@ -116,4 +122,83 @@ test('all third-party release actions use reviewed full commit pins', () => {
   const uses = [...workflow.matchAll(/^\s+- uses: ([^\s]+)$/gm)].map((match) => match[1])
   assert.ok(uses.length > 0)
   for (const action of uses) assert.match(action, /^[^@]+@[0-9a-f]{40}$/)
+})
+
+test('tag publication uploads one immutable six-file provenance artifact after draft revalidation', () => {
+  assert.match(publish, /permissions:\n      contents: write\n      actions: write/)
+  const revalidation = publish.indexOf('Download and revalidate exact draft assets')
+  const upload = publish.indexOf('actions\/upload-artifact@')
+  assert.ok(revalidation >= 0)
+  assert.ok(upload > revalidation)
+  assert.match(publish, /id: draft_assets/)
+  assert.match(publish, /name: release-provenance-\$\{\{ github\.ref_name \}\}/)
+  assert.match(publish, /path: \$\{\{ steps\.draft_assets\.outputs\.directory \}\}/)
+  assert.match(publish, /if-no-files-found: error/)
+  assert.match(publish, /steps\.provenance_artifact\.outputs\.artifact-id/)
+  assert.match(publish, /steps\.provenance_artifact\.outputs\.artifact-digest/)
+  assert.match(publish, /tag SHA|tag_sha/i)
+  assert.match(publish, /digest_set/)
+})
+
+test('legacy backfill is literal, owner/main-only, and actions-write-only for v0.2.3', () => {
+  assert.match(backfill, /^    needs: verify$/m)
+  assert.match(backfill, /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main' && github\.actor == github\.repository_owner && inputs\.operation == 'legacy-backfill' && inputs\.version == 'v0\.2\.3' && needs\.verify\.result == 'success' \}\}/)
+  assert.match(backfill, /permissions:\n      contents: read\n      actions: write/)
+  assert.match(backfill, /ref: \$\{\{ github\.sha \}\}/)
+  assert.match(backfill, /ref: refs\/tags\/v0\.2\.3/)
+  assert.match(backfill, /path: trusted-source/)
+  assert.match(backfill, /LEGACY_RECORD: trusted-source\/release-provenance\/v0\.2\.3\.json/)
+  assert.ok(backfill.indexOf('ref: refs/tags/v0.2.3') < backfill.indexOf('ref: ${{ github.sha }}'))
+  assert.match(backfill, /test -f "\$LEGACY_RECORD"/)
+  assert.match(backfill, /jq -r '\.version' "\$LEGACY_RECORD"/)
+  assert.match(backfill, /jq -r '\.tag_sha' "\$LEGACY_RECORD"/)
+  assert.match(backfill, /8ece01f324f5d6f37a120b5efcbb3796fa6eab6e/)
+  assert.match(backfill, /release-provenance\/v0\.2\.3\.json/)
+  assert.match(backfill, /build-release\.sh v0\.2\.3/)
+  assert.match(backfill, /actions\/upload-artifact@/)
+  assert.match(backfill, /name: release-provenance-v0\.2\.3/)
+  assert.match(backfill, /if-no-files-found: error/)
+  assert.doesNotMatch(backfill, /contents: write|gh release|SNAPIFACT_R2_|r2-release-preview|\bPAT\b|production/i)
+  assert.doesNotMatch(backfill, /inputs\.(?:source|sha|artifact|run|digest)/)
+})
+
+test('preview jobs independently select one successful non-expired artifact and bind its digest', () => {
+  for (const job of [preflight, preview]) {
+    assert.match(job, /actions: read/)
+    assert.match(job, /actions\/workflows\/release\.yml\/runs\?event=/)
+    assert.match(job, /conclusion.*success|status.*success/)
+    assert.match(job, /expired.*false/)
+    assert.match(job, /length.*1|length == 1/)
+    assert.match(job, /artifact-digest|\.digest/)
+    assert.match(job, /sha256sum.*archive|artifact_digest/)
+    assert.match(job, /unzip/)
+    assert.match(job, /validateAssets/)
+    assert.match(job, /release-provenance-\$RELEASE_VERSION/)
+    assert.match(job, /for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install\.sh/)
+    assert.match(job, /installer|install\.sh/)
+    assert.match(job, /directory=/)
+    assert.doesNotMatch(job, /gh release (view|download)/)
+  }
+  assert.match(preflight, /run_id:|artifact_id:|artifact_digest:/)
+  assert.match(preview, /PREFLIGHT_RUN_ID|PREFLIGHT_ARTIFACT_ID|PREFLIGHT_ARTIFACT_DIGEST/)
+  assert.match(preview, /tag_sha.*PREFLIGHT_TAG_SHA|PREFLIGHT_TAG_SHA.*tag_sha/)
+  assert.match(preview, /digest_set.*PREFLIGHT_DIGEST_SET|PREFLIGHT_DIGEST_SET.*digest_set/)
+})
+
+test('legacy provenance record is sanitized and contains the six reviewed digests', async () => {
+  const record = JSON.parse(await readFile(new URL('../release-provenance/v0.2.3.json', import.meta.url), 'utf8'))
+  assert.deepEqual(record, {
+    version: 'v0.2.3',
+    tag_sha: '8ece01f324f5d6f37a120b5efcbb3796fa6eab6e',
+    artifact_name: 'release-provenance-v0.2.3',
+    asset_digests: {
+      snapifact_linux_amd64: '76cc21868e36dc81d53f2ddb2bc10404ef864fbcae36c194076dbf536e63ead6',
+      snapifact_linux_arm64: '074e298d8819b78313c44a467a69c2a1903af6f87ec38dffee8e6aab34dbed18',
+      snapifact_darwin_amd64: 'e8e10dfb732735b07673445002216254d2508ad959e15377d5276669b8a5407b',
+      snapifact_darwin_arm64: '65da2521c2fd4e56dc3032fb4eb0cabc76a14d80ecbe57d163b854440626b87a',
+      SHA256SUMS: '7af0c5df06bfb9db6e1b799a3a201489fce71786c98894292ee784e71e2728fc',
+      'install.sh': 'b5fe812c2c4109d2869cbc658598a91df703d3f587dfd56be6c4d989d8439995',
+    },
+  })
+  assert.doesNotMatch(JSON.stringify(record), /https?:|secret|token|signature|endpoint|body|bytes/i)
 })

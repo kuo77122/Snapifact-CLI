@@ -1,0 +1,13 @@
+{
+  "version": "v0.2.3",
+  "tag_sha": "8ece01f324f5d6f37a120b5efcbb3796fa6eab6e",
+  "artifact_name": "release-provenance-v0.2.3",
+  "asset_digests": {
+    "snapifact_linux_amd64": "76cc21868e36dc81d53f2ddb2bc10404ef864fbcae36c194076dbf536e63ead6",
+    "snapifact_linux_arm64": "074e298d8819b78313c44a467a69c2a1903af6f87ec38dffee8e6aab34dbed18",
+    "snapifact_darwin_amd64": "e8e10dfb732735b07673445002216254d2508ad959e15377d5276669b8a5407b",
+    "snapifact_darwin_arm64": "65da2521c2fd4e56dc3032fb4eb0cabc76a14d80ecbe57d163b854440626b87a",
+    "SHA256SUMS": "7af0c5df06bfb9db6e1b799a3a201489fce71786c98894292ee784e71e2728fc",
+    "install.sh": "b5fe812c2c4109d2869cbc658598a91df703d3f587dfd56be6c4d989d8439995"
+  }
+}
