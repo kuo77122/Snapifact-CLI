@@ -145,12 +145,12 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: ${{ github.sha }}
-          path: trusted-source
+          ref: refs/tags/v0.2.3
           fetch-depth: 1
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
-          ref: refs/tags/v0.2.3
+          ref: ${{ github.sha }}
+          path: trusted-source
           fetch-depth: 1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
@@ -161,6 +161,9 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$LEGACY_TAG_SHA"
           test "$(git rev-parse 'refs/tags/v0.2.3^{commit}')" = "$LEGACY_TAG_SHA"
+          test -f "$LEGACY_RECORD"
+          [[ "$(jq -r '.version' "$LEGACY_RECORD")" == "$LEGACY_VERSION" ]]
+          [[ "$(jq -r '.tag_sha' "$LEGACY_RECORD")" == "$LEGACY_TAG_SHA" ]]
           GITHUB_REF=refs/tags/v0.2.3 GITHUB_REF_NAME=v0.2.3 GITHUB_SHA="$LEGACY_TAG_SHA" ./scripts/build-release.sh v0.2.3
           ./scripts/validate-release.sh dist
           for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
