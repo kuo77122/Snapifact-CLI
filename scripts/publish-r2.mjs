@@ -15,6 +15,7 @@ export const RELEASE_ASSETS = Object.freeze([...BINARY_ASSETS, 'SHA256SUMS', 'in
 const CHECKSUM_ASSETS = Object.freeze([...BINARY_ASSETS, 'install.sh'])
 const VERSION_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const HEX_PATTERN = /^[0-9a-f]{64}$/
+const ETAG_PATTERN = /^"(?:[^"\\\r\n]|\\.)+"$/
 const PUBLIC_MAX_ATTEMPTS = 3
 const PUBLIC_REQUEST_TIMEOUT_MS = 2000
 const PUBLIC_RETRY_DELAY_MS = 100
@@ -37,12 +38,13 @@ export const STABLE_CONTENT_TYPE = 'application/json; charset=utf-8'
 export const COMMANDS = Object.freeze(['publish', 'verify', 'rollback'])
 
 export class PublicationError extends Error {
-  constructor(code, message, { retryable = false, status = undefined } = {}) {
+  constructor(code, message, { retryable = false, status = undefined, diagnostics = undefined } = {}) {
     super(message)
     this.name = 'PublicationError'
     this.code = code
     this.retryable = retryable
     this.status = status
+    this.diagnostics = diagnostics
   }
 }
 
@@ -145,6 +147,25 @@ function bytesEqual(left, right) {
 
 function header(response, name) {
   return response.headers?.get(name) ?? ''
+}
+
+function etagDiagnostics(etag) {
+  return {
+    present: Boolean(etag),
+    quoted: typeof etag === 'string' && ETAG_PATTERN.test(etag),
+    ...(etag ? { fingerprint: createHash('sha256').update(etag).digest('hex').slice(0, 16) } : {}),
+  }
+}
+
+function stableConflictError(message, status, { classification, precondition, readback } = {}) {
+  return new PublicationError('conditional-conflict', message, {
+    status,
+    diagnostics: {
+      classification,
+      precondition: etagDiagnostics(precondition?.etag),
+      ...(readback ? { readback } : {}),
+    },
+  })
 }
 
 function responseBytes(response) {
@@ -456,6 +477,11 @@ export class R2Publisher {
     const headers = stableMetadata()
     if (current) {
       if (!current.etag) fail('invalid-stable', 'stable index has no usable ETag')
+      if (!ETAG_PATTERN.test(current.etag)) {
+        fail('invalid-precondition', 'stable index ETag precondition is malformed', {
+          diagnostics: { precondition: etagDiagnostics(current.etag) },
+        })
+      }
       headers['if-match'] = current.etag
     } else {
       headers['if-none-match'] = '*'
@@ -468,7 +494,10 @@ export class R2Publisher {
     }
     if (response.ok) return
     if (response.status === 412 && allowConflict) {
-      fail('conditional-conflict', 'stable index changed during publication', { status: response.status })
+      throw stableConflictError('stable index conditional precondition failed', response.status, {
+        classification: 'precondition-failed',
+        precondition: current,
+      })
     }
     if (response.status >= 500) return this.resolveStableAmbiguity(stable, current)
     throw safeResponseError('stable PUT', response)
@@ -481,6 +510,74 @@ export class R2Publisher {
       return
     }
     fail('ambiguous-mismatch', 'stable write outcome is mismatched')
+  }
+
+  async recoverLatestFromPrior(prior, diagnostics) {
+    if (!prior) return
+    try {
+      await this.restoreLatest(prior)
+    } catch {
+      fail('compensation-failed', 'latest release compensation did not converge', { diagnostics })
+    }
+  }
+
+  async resolveStableConflict(stable, prior, conflict) {
+    let actual
+    try {
+      actual = await this.readStableSigned({ allowMissing: true })
+    } catch {
+      const diagnostics = {
+        classification: 'readback-unavailable',
+        precondition: etagDiagnostics(prior?.etag),
+        readback: 'unavailable',
+      }
+      await this.recoverLatestFromPrior(prior, diagnostics)
+      throw stableConflictError('stable index readback was unavailable after conditional failure', conflict.status, {
+        classification: diagnostics.classification,
+        precondition: prior,
+        readback: diagnostics.readback,
+      })
+    }
+    if (!actual) {
+      const diagnostics = {
+        classification: 'readback-missing',
+        precondition: etagDiagnostics(prior?.etag),
+        readback: 'missing',
+      }
+      await this.recoverLatestFromPrior(prior, diagnostics)
+      throw stableConflictError('stable index was missing after conditional failure', conflict.status, {
+        classification: diagnostics.classification,
+        precondition: prior,
+        readback: diagnostics.readback,
+      })
+    }
+    if (bytesEqual(actual.bytes, stable.bytes)) {
+      try {
+        await this.verifyConvergence(stable)
+        return true
+      } catch {
+        try {
+          await this.restoreLatest(actual)
+        } catch {
+          fail('compensation-failed', 'latest release compensation did not converge')
+        }
+        throw stableConflictError('stable index reached target but latest did not converge', conflict.status, {
+          classification: 'stale-precondition',
+          precondition: prior,
+          readback: 'same-target',
+        })
+      }
+    }
+    try {
+      await this.restoreLatest(actual)
+    } catch {
+      fail('compensation-failed', 'latest release compensation did not converge')
+    }
+    throw stableConflictError('stable index changed during publication', conflict.status, {
+      classification: 'state-changed',
+      precondition: prior,
+      readback: 'different-target',
+    })
   }
 
   async verifySignedRelease(version) {
@@ -587,18 +684,9 @@ export class R2Publisher {
       return { version, manifest_sha256: verified.manifest_sha256 }
     } catch (error) {
       if (error.code === 'conditional-conflict') {
-        const actual = await this.readStableSigned({ allowMissing: true })
-        if (actual && bytesEqual(actual.bytes, stable.bytes)) {
-          try {
-            await this.verifyConvergence(verified)
-            return { version, manifest_sha256: verified.manifest_sha256 }
-          } catch {
-            await this.restoreLatest(actual)
-          }
-        } else if (actual) {
-          await this.restoreLatest(actual)
+        if (await this.resolveStableConflict(stable, prior, error)) {
+          return { version, manifest_sha256: verified.manifest_sha256 }
         }
-        throw error
       }
       if (latestStarted && prior) await this.recoverLatest(prior)
       throw error
@@ -630,18 +718,9 @@ export class R2Publisher {
       return { version, manifest_sha256: verified.manifest_sha256 }
     } catch (error) {
       if (error.code === 'conditional-conflict') {
-        const actual = await this.readStableSigned({ allowMissing: true })
-        if (actual && bytesEqual(actual.bytes, stable.bytes)) {
-          try {
-            await this.verifyConvergence(verified)
-            return { version, manifest_sha256: verified.manifest_sha256 }
-          } catch {
-            await this.restoreLatest(actual)
-          }
-        } else if (actual) {
-          await this.restoreLatest(actual)
+        if (await this.resolveStableConflict(stable, prior, error)) {
+          return { version, manifest_sha256: verified.manifest_sha256 }
         }
-        throw error
       }
       if (latestStarted && prior) await this.recoverLatest(prior)
       throw error
