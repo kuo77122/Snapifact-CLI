@@ -24,11 +24,17 @@ require "$workflow" 'canonical_tag:'
 require "$workflow" 'canonical_tag=true'
 require "$workflow" 'pull_request:'
 require "$workflow" 'push:'
-require "$workflow" 'refs/tags/v(0|[1-9][0-9]*)'
-require "$workflow" 'needs: verify'
-require "$workflow" "needs.verify.outputs.canonical_tag == 'true'"
-require "$workflow" 'github.event_name == '\''push'\'''
-require "$workflow" 'contents: write'
+require "$workflow" 'workflow_dispatch:'
+require "$workflow" 'github.actor == github.repository_owner'
+require "$workflow" 'refs/heads/main'
+require "$workflow" 'ref: ${{ github.sha }}'
+require "$workflow" 'needs: preflight'
+require "$workflow" 'environment: r2-release-preview'
+require "$workflow" 'cancel-in-progress: false'
+require "$workflow" 'gh api'
+require "$workflow" 'validateAssets'
+require "$workflow" 'sha256sum'
+require "$workflow" 'gh release download'
 require "$workflow" 'gh release create'
 require "$workflow" '--verify-tag'
 require "$workflow" '--draft'
@@ -38,16 +44,19 @@ require "$workflow" 'snapifact_darwin_amd64'
 require "$workflow" 'snapifact_darwin_arm64'
 require "$workflow" 'SHA256SUMS'
 require "$workflow" 'install.sh'
-require "$workflow" 'validate-release.sh'
+require "$workflow" 'publish-r2.mjs publish'
+require "$workflow" 'publish-r2.mjs verify'
+require "$workflow" 'publish-r2.mjs rollback'
 
-if [[ "$workflow" == *'workflow_dispatch'* ]]; then
-	fail 'manual dispatch is present'
+if [[ "$workflow" == *'r2-release-production'* || "$workflow" == *'production'* ]]; then
+	fail 'production publication boundary is referenced'
 fi
-blocked_one=$(printf '\143\157\162\145')
-blocked_two=$(printf '\122\62')
-blocked_three=$(printf '\160\162\157\144\165\143\164\151\157\156')
-if [[ "$workflow" == *"$blocked_one"* || "$workflow" == *"$blocked_two"* || "$workflow" == *"$blocked_three"* ]]; then
-	fail 'forbidden publication boundary is referenced'
+if [[ "$workflow" == *'inputs.environment'* || "$workflow" == *'inputs.bucket'* || "$workflow" == *'inputs.public_origin'* ]]; then
+	fail 'generic environment selector is present'
+fi
+if [[ "$workflow" == *'gh release edit'* || "$workflow" == *'gh release delete'* || "$workflow" == *' list '* || "$workflow" == *' delete '* ]]; then
+	fail 'release mutation or arbitrary object interface is present'
 fi
 
+node --test "$ROOT/scripts/release-workflow.test.mjs"
 printf 'release workflow contract tests passed\n'
