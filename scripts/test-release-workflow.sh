@@ -47,6 +47,8 @@ require "$workflow" 'install.sh'
 require "$workflow" 'publish-r2.mjs publish'
 require "$workflow" 'publish-r2.mjs verify'
 require "$workflow" 'publish-r2.mjs rollback'
+require "$workflow" 'stable-diagnostic'
+require "$workflow" 'node scripts/publish-r2.mjs stable-diagnostic'
 
 if [[ "$workflow" == *'r2-release-production'* || "$workflow" == *'production'* ]]; then
 	fail 'production publication boundary is referenced'

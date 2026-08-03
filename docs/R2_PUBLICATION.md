@@ -1,8 +1,9 @@
 # Preview R2 rehearsal
 
-This repository contains the fixed-key publication helper and one protected
-Preview rehearsal. Local and contributor workflows never resolve R2
-credentials or send signed requests.
+This repository contains the fixed-key publication helper, one protected
+Preview rehearsal, and one protected signed-read-only stable validator
+diagnostic. Local and contributor workflows never resolve R2 credentials or
+send signed requests.
 
 ## Before dispatch
 
@@ -29,7 +30,7 @@ same artifact shape. A mismatch uploads nothing.
 ## Rehearsal flow
 
 Dispatch **Release** from standalone `main` as the repository owner with the
-canonical release version. The workflow:
+canonical release version and `preview` operation. The workflow:
 
 1. checks out the dispatch `github.sha`, never the version tag, for trusted
    helper/workflow code;
@@ -42,6 +43,16 @@ canonical release version. The workflow:
    identity/digest/inventory invariant, and publishes only from that directory;
 6. runs `publish`, public `verify`, matching `publish` retry, public `verify`,
    same-version `rollback`, and final public `verify` from that directory.
+
+To diagnose the stable validator instead, dispatch the literal
+`stable-diagnostic` operation without a version. Before the protected Preview
+values are available, it proves the checked-out 40-hex SHA is the repository's
+dispatch-time `origin/main` commit and is reachable from fetched `main`. The
+final step performs exactly one signed GET for the literal
+`channels/stable.json` key and emits only the status, validator presence,
+mutually exclusive shape, byte length, and first 12 lowercase SHA-256
+characters of the validator. It never emits the validator, body, URL,
+credentials, headers, account, bucket, or origin.
 
 No PR, fork, ordinary push, non-main ref, non-owner dispatch, noncanonical
 version, tag drift, missing/failed/multiple/ambiguous/expired artifact,

@@ -21,6 +21,7 @@ const publish = jobBlock('publish')
 const preflight = jobBlock('preflight')
 const preview = jobBlock('preview-r2-rehearsal')
 const backfill = jobBlock('backfill-v023')
+const diagnostic = jobBlock('stable-diagnostic')
 const assets = [
   'snapifact_linux_amd64',
   'snapifact_linux_arm64',
@@ -42,6 +43,47 @@ test('manual preview is owner-only, main-only, and checks out dispatch HEAD', ()
   )
   assert.match(preflight, /ref: \$\{\{ github\.sha \}\}/)
   assert.match(preview, /ref: \$\{\{ github\.sha \}\}/)
+})
+
+test('stable diagnostic is an owner/main-only operation with exact source binding', () => {
+  assert.match(workflow, /- stable-diagnostic/)
+  assert.match(
+    diagnostic,
+    /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main' && github\.actor == github\.repository_owner && inputs\.operation == 'stable-diagnostic' && needs\.verify\.result == 'success' \}\}/,
+  )
+  assert.match(diagnostic, /^    needs: verify$/m)
+  assert.match(diagnostic, /ref: \$\{\{ github\.sha \}\}/)
+  assert.match(diagnostic, /GITHUB_REPOSITORY.*kuo77122\/Snapifact-CLI/)
+  assert.match(diagnostic, /GITHUB_SHA.*\^\[0-9a-f\]\{40\}\$/)
+  assert.match(diagnostic, /git fetch --no-tags origin refs\/heads\/main:refs\/remotes\/origin\/main/)
+  assert.match(diagnostic, /git ls-remote origin refs\/heads\/main/)
+  assert.match(diagnostic, /refs\/remotes\/origin\/main/)
+  assert.match(diagnostic, /git merge-base --is-ancestor/)
+  assert.doesNotMatch(diagnostic, /inputs\.(?:version|key|url|assets|environment|bucket|public_origin)/)
+})
+
+test('stable diagnostic binds only the five existing Preview values on its final step', () => {
+  assert.match(diagnostic, /^    environment: r2-release-preview$/m)
+  assert.match(diagnostic, /concurrency:\n      group: snapifact-r2-preview-publication\n      cancel-in-progress: false/)
+  assert.match(diagnostic, /permissions:\n      contents: read/)
+  assert.doesNotMatch(diagnostic, /contents: write|actions: write|upload-artifact|gh release|publish-r2\.mjs (publish|verify|rollback)|\b(?:PUT|POST|PATCH|DELETE|LIST)\b/i)
+
+  const credentialStart = diagnostic.indexOf('      - name: Read stable validator diagnostic')
+  assert.ok(credentialStart >= 0)
+  const credentialStep = diagnostic.slice(credentialStart)
+  assert.doesNotMatch(diagnostic.slice(0, credentialStart), /SNAPIFACT_R2_/)
+  for (const reference of [
+    'secrets.SNAPIFACT_R2_ACCESS_KEY_ID',
+    'secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY',
+    'vars.SNAPIFACT_R2_ACCOUNT_ID',
+    'vars.SNAPIFACT_R2_BUCKET',
+    'vars.SNAPIFACT_R2_PUBLIC_ORIGIN',
+  ]) {
+    assert.equal((diagnostic.match(new RegExp(reference.replaceAll('.', '\\.'), 'g')) ?? []).length, 1, reference)
+    assert.match(credentialStep, new RegExp(reference.replaceAll('.', '\\.')))
+  }
+  assert.deepEqual([...credentialStep.matchAll(/node scripts\/publish-r2\.mjs stable-diagnostic/g)].map(() => 'stable-diagnostic'), ['stable-diagnostic'])
+  assert.doesNotMatch(credentialStep, /--(?:key|url|version|assets|environment)/)
 })
 
 test('dispatch version selects release assets and helper arguments, never implementation code', () => {
@@ -97,7 +139,7 @@ test('only the final credential-bearing step binds approved Preview values', () 
     'vars.SNAPIFACT_R2_BUCKET',
     'vars.SNAPIFACT_R2_PUBLIC_ORIGIN',
   ]) {
-    assert.equal((workflow.match(new RegExp(reference.replaceAll('.', '\\.'), 'g')) ?? []).length, 1, reference)
+    assert.equal((preview.match(new RegExp(reference.replaceAll('.', '\\.'), 'g')) ?? []).length, 1, reference)
     assert.doesNotMatch(beforeCredentials, new RegExp(reference.replaceAll('.', '\\.')))
     assert.match(credentialStep, new RegExp(reference.replaceAll('.', '\\.')))
   }

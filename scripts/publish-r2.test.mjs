@@ -9,6 +9,7 @@ import {
   BINARY_ASSETS,
   CACHE_CONTROL,
   CONTENT_TYPES,
+  formatStableDiagnostic,
   RELEASE_ASSETS,
   compareVersions,
   isAllowedKey,
@@ -18,6 +19,7 @@ import {
   parseVersion,
   R2Publisher,
   run,
+  parseArguments,
   sanitizeError,
   stableBytes,
   validateAssets,
@@ -66,6 +68,99 @@ test('publishes only fixed object names with fixed metadata', () => {
   assert.equal(isAllowedKey('downloads/v1.2.3/secret.txt'), false)
   assert.equal(isAllowedKey('downloads/v1.2.3/../secret.txt'), false)
   assert.equal(isAllowedKey('channels/stable.json'), true)
+})
+
+function diagnosticPublisher({ status = 200, etag, body = 'diagnostic body must stay private' } = {}) {
+  const calls = []
+  const publisher = new R2Publisher({
+    s3Origin: 'https://account.example/bucket',
+    publicOrigin: 'https://public.example',
+    signedFetch: async (url, init) => {
+      calls.push({ method: init.method, key: new URL(url).pathname.replace('/bucket/', '') })
+      return new Response(body, {
+        status,
+        headers: etag === undefined ? undefined : { etag },
+      })
+    },
+  })
+  return { calls, publisher }
+}
+
+test('diagnoses stable ETag shape with one fixed signed GET and sanitized output', async () => {
+  for (const fixture of [
+    { etag: '"strong-value"', shape: 'strong-quoted', length: 14, fingerprint: '74d204071e7a' },
+    { etag: 'W/"weak-value"', shape: 'weak-quoted', length: 14, fingerprint: 'd78186d6f5b1' },
+    { etag: 'bare-value', shape: 'bare', length: 10, fingerprint: 'a0e140eecd20' },
+    { etag: '"a", "b"', shape: 'list-valued', length: 8, fingerprint: 'c024f81b26bb' },
+    {
+      etag: 'malformed https://secret.example Authorization:Bearer-token',
+      shape: 'other',
+      length: 59,
+      fingerprint: '8c5fa57ab17a',
+    },
+  ]) {
+    const fake = diagnosticPublisher({ etag: fixture.etag })
+    const result = await fake.publisher.diagnoseStableETag()
+
+    assert.deepEqual(result, {
+      status: 'present',
+      present: true,
+      shape: fixture.shape,
+      length: fixture.length,
+      fingerprint: fixture.fingerprint,
+    })
+    assert.deepEqual(fake.calls, [{ method: 'GET', key: 'channels/stable.json' }])
+    const output = formatStableDiagnostic(result)
+    assert.deepEqual(Object.keys(JSON.parse(output)), ['status', 'present', 'shape', 'length', 'fingerprint'])
+    assert.doesNotMatch(output, /malformed|secret|Authorization|Bearer|https:|diagnostic body/)
+  }
+})
+
+test('diagnostic reports missing and request failures without exposing response data', async () => {
+  const missing = diagnosticPublisher({ status: 404, body: 'private missing response' })
+  assert.deepEqual(await missing.publisher.diagnoseStableETag(), {
+    status: 'missing', present: false, shape: 'other', length: 0, fingerprint: null,
+  })
+  assert.deepEqual(missing.calls, [{ method: 'GET', key: 'channels/stable.json' }])
+
+  const failed = diagnosticPublisher({ status: 503, body: 'private provider response' })
+  assert.deepEqual(await failed.publisher.diagnoseStableETag(), {
+    status: 'request-failed', present: false, shape: 'other', length: 0, fingerprint: null,
+  })
+  assert.deepEqual(failed.calls, [{ method: 'GET', key: 'channels/stable.json' }])
+
+  const output = formatStableDiagnostic(await failed.publisher.diagnoseStableETag())
+  assert.doesNotMatch(output, /private|provider|response|503/)
+})
+
+test('stable diagnostic command has no caller-controlled selector or mutation arguments', () => {
+  assert.deepEqual(parseArguments(['stable-diagnostic']), { command: 'stable-diagnostic' })
+  for (const argument of [
+    ['stable-diagnostic', '--key', 'other.json'],
+    ['stable-diagnostic', '--url', 'https://public.example'],
+    ['stable-diagnostic', '--version', 'v0.2.2'],
+    ['stable-diagnostic', '--assets', 'dist'],
+    ['stable-diagnostic', '--environment', 'production'],
+  ]) assert.throws(() => parseArguments(argument))
+})
+
+test('stable diagnostic CLI emits one sanitized record and no error text', async () => {
+  const fake = diagnosticPublisher({ etag: '"https://user:secret@example.invalid"' })
+  const output = []
+  const status = await run(['stable-diagnostic'], {
+    publisherFactory: () => fake.publisher,
+    writeOutput: (text) => output.push(text),
+  })
+
+  assert.equal(status, 0)
+  assert.deepEqual(JSON.parse(output.join('')), {
+    status: 'present',
+    present: true,
+    shape: 'strong-quoted',
+    length: 37,
+    fingerprint: '6bcca9be25c1',
+  })
+  assert.doesNotMatch(output.join(''), /https:|secret|example|user|error|ETag/i)
 })
 
 test('validates the exact six-file release inventory before constructing a client', async () => {

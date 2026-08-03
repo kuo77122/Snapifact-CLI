@@ -16,6 +16,9 @@ const CHECKSUM_ASSETS = Object.freeze([...BINARY_ASSETS, 'install.sh'])
 const VERSION_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const HEX_PATTERN = /^[0-9a-f]{64}$/
 const ETAG_PATTERN = /^"(?:[^"\\\r\n]|\\.)+"$/
+const DIAGNOSTIC_QUOTED_ETAG_PATTERN = /^"(?:[^"\\\r\n]|\\.)*"$/
+const DIAGNOSTIC_WEAK_ETAG_PATTERN = /^W\/"(?:[^"\\\r\n]|\\.)*"$/
+const DIAGNOSTIC_BARE_ETAG_PATTERN = /^[^\s",]+$/
 const PUBLIC_MAX_ATTEMPTS = 3
 const PUBLIC_REQUEST_TIMEOUT_MS = 2000
 const PUBLIC_RETRY_DELAY_MS = 100
@@ -35,7 +38,7 @@ export const CACHE_CONTROL = Object.freeze({
 })
 
 export const STABLE_CONTENT_TYPE = 'application/json; charset=utf-8'
-export const COMMANDS = Object.freeze(['publish', 'verify', 'rollback'])
+export const COMMANDS = Object.freeze(['publish', 'verify', 'rollback', 'stable-diagnostic'])
 
 export class PublicationError extends Error {
   constructor(code, message, { retryable = false, status = undefined, diagnostics = undefined } = {}) {
@@ -147,6 +150,54 @@ function bytesEqual(left, right) {
 
 function header(response, name) {
   return response.headers?.get(name) ?? ''
+}
+
+function hasUnquotedComma(value) {
+  let quoted = false
+  let escaped = false
+  for (const character of value) {
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (quoted && character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"') quoted = !quoted
+    if (character === ',' && !quoted) return true
+  }
+  return false
+}
+
+function stableDiagnosticShape(etag) {
+  if (etag === null || hasUnquotedComma(etag)) return etag === null ? 'other' : 'list-valued'
+  if (DIAGNOSTIC_QUOTED_ETAG_PATTERN.test(etag)) return 'strong-quoted'
+  if (DIAGNOSTIC_WEAK_ETAG_PATTERN.test(etag)) return 'weak-quoted'
+  if (DIAGNOSTIC_BARE_ETAG_PATTERN.test(etag)) return 'bare'
+  return 'other'
+}
+
+function stableDiagnosticRecord(status, etag = null) {
+  const present = etag !== null
+  const length = present ? new TextEncoder().encode(etag).byteLength : 0
+  return {
+    status,
+    present,
+    shape: stableDiagnosticShape(etag),
+    length,
+    fingerprint: present ? createHash('sha256').update(etag).digest('hex').slice(0, 12) : null,
+  }
+}
+
+export function formatStableDiagnostic(record) {
+  return `${JSON.stringify({
+    status: record.status,
+    present: record.present,
+    shape: record.shape,
+    length: record.length,
+    fingerprint: record.fingerprint,
+  })}\n`
 }
 
 function etagDiagnostics(etag) {
@@ -464,6 +515,18 @@ export class R2Publisher {
     }
   }
 
+  async diagnoseStableETag() {
+    try {
+      const response = await this.signedRequest('GET', 'channels/stable.json')
+      await response.arrayBuffer()
+      if (response.status === 404) return stableDiagnosticRecord('missing')
+      if (!response.ok) return stableDiagnosticRecord('request-failed')
+      return stableDiagnosticRecord('present', response.headers?.get('etag') ?? null)
+    } catch {
+      return stableDiagnosticRecord('request-failed')
+    }
+  }
+
   async readStablePublic({ expected = false } = {}) {
     const get = await this.publicRequest('GET', 'channels/stable.json', { retry: expected, retry404: expected })
     if (get.status === 404) return null
@@ -730,7 +793,11 @@ export class R2Publisher {
 
 export function parseArguments(argv) {
   const [command, ...args] = argv
-  if (!COMMANDS.includes(command)) fail('usage', 'command must be publish, verify, or rollback')
+  if (!COMMANDS.includes(command)) fail('usage', 'command is not approved')
+  if (command === 'stable-diagnostic') {
+    if (args.length) fail('usage', 'stable diagnostic accepts no arguments')
+    return { command }
+  }
   const values = {}
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i]
@@ -753,9 +820,21 @@ export function sanitizeError(error) {
   return 'publication failed'
 }
 
-export async function run(argv, { env = process.env, fetchImpl = globalThis.fetch, publisherFactory = createPublisherFromEnv } = {}) {
+export async function run(argv, {
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  publisherFactory = createPublisherFromEnv,
+  writeOutput = (text) => process.stdout.write(text),
+} = {}) {
+  let command
   try {
-    const command = parseArguments(argv)
+    command = parseArguments(argv)
+    if (command.command === 'stable-diagnostic') {
+      const publisher = publisherFactory(env, { fetchImpl })
+      const result = await publisher.diagnoseStableETag()
+      writeOutput(formatStableDiagnostic(result))
+      return result.status === 'request-failed' ? 1 : 0
+    }
     if (command.command === 'publish') await validateAssets(command.assets, command.version)
     const publisher = publisherFactory(env, { fetchImpl })
     if (command.command === 'publish') await publisher.publish(command.version, command.assets)
@@ -763,6 +842,10 @@ export async function run(argv, { env = process.env, fetchImpl = globalThis.fetc
     if (command.command === 'rollback') await publisher.rollback(command.version)
     return 0
   } catch (error) {
+    if (command?.command === 'stable-diagnostic') {
+      writeOutput(formatStableDiagnostic(stableDiagnosticRecord('request-failed')))
+      return 1
+    }
     process.stderr.write(`publish-r2: ${sanitizeError(error)}\n`)
     return 1
   }
