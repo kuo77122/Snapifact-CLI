@@ -18,6 +18,7 @@ import {
   parseVersion,
   R2Publisher,
   run,
+  sanitizeError,
   stableBytes,
   validateAssets,
 } from './publish-r2.mjs'
@@ -268,7 +269,60 @@ test('compensates latest to the observed stable release after a stale stable con
   })
   fake.setStablePutHook(() => new Response(null, { status: 412 }))
 
-  await assert.rejects(fake.publisher.publish('v0.2.3', newDirectory), /stable index changed/)
+  await assert.rejects(
+    fake.publisher.publish('v0.2.3', newDirectory),
+    (error) => {
+      assert.match(error.message, /stable index changed/)
+      assert.equal(error.diagnostics.classification, 'state-changed')
+      assert.doesNotMatch(sanitizeError(error), /old-stable/)
+      return true
+    },
+  )
+  for (const asset of RELEASE_ASSETS) {
+    assert.deepEqual(fake.objects.get(`downloads/latest/${asset}`).bytes, old.assets[asset])
+  }
+})
+
+test('restores latest from trusted prior state when stable 412 readback is invalid', async () => {
+  const oldDirectory = await createReleaseAssets('v0.2.2')
+  const newDirectory = await createReleaseAssets('v0.2.3')
+  const fake = fakeR2()
+  const old = await validateAssets(oldDirectory, 'v0.2.2')
+  for (const asset of RELEASE_ASSETS) {
+    fake.objects.set(`downloads/v0.2.2/${asset}`, {
+      bytes: old.assets[asset],
+      headers: { 'content-type': CONTENT_TYPES[asset], 'cache-control': CACHE_CONTROL.immutable },
+      etag: `"old-${asset}"`,
+    })
+    fake.objects.set(`downloads/latest/${asset}`, {
+      bytes: old.assets[asset],
+      headers: { 'content-type': CONTENT_TYPES[asset], 'cache-control': CACHE_CONTROL.mutable },
+      etag: `"latest-${asset}"`,
+    })
+  }
+  fake.objects.set('channels/stable.json', {
+    bytes: stableBytes('v0.2.2', old.manifest_sha256),
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': CACHE_CONTROL.mutable },
+    etag: '"old-stable"',
+  })
+  fake.setStablePutHook(() => {
+    fake.objects.set('channels/stable.json', {
+      bytes: new TextEncoder().encode('{not-json}\n'),
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': CACHE_CONTROL.mutable },
+      etag: '"unreadable-stable"',
+    })
+    return new Response(null, { status: 412 })
+  })
+
+  await assert.rejects(
+    fake.publisher.publish('v0.2.3', newDirectory),
+    (error) => {
+      assert.match(error.message, /compensation did not converge/)
+      assert.equal(error.diagnostics.classification, 'readback-unavailable')
+      assert.doesNotMatch(sanitizeError(error), /unreadable-stable/)
+      return true
+    },
+  )
   for (const asset of RELEASE_ASSETS) {
     assert.deepEqual(fake.objects.get(`downloads/latest/${asset}`).bytes, old.assets[asset])
   }
@@ -301,6 +355,31 @@ test('preserves the opaque quoted ETag for same-version conditional promotion', 
   await fake.publisher.publish('v0.2.2', directory)
   const stablePut = fake.signedCalls.find(({ method, key }) => method === 'PUT' && key === 'channels/stable.json')
   assert.match(stablePut.headers.get('if-match'), /^"fake-/)
+})
+
+test('rejects malformed stable ETags before sending a conditional write', async () => {
+  let signedPuts = 0
+  const publisher = new R2Publisher({
+    s3Origin: 'https://account.example/bucket',
+    publicOrigin: 'https://public.example',
+    signedFetch: async (_url, init) => {
+      if (init.method === 'PUT') signedPuts += 1
+      return new Response(null, { status: 200 })
+    },
+  })
+  const current = { version: 'v0.2.2', manifest_sha256: 'a'.repeat(64), etag: 'unquoted-secret' }
+  const stable = { version: 'v0.2.3', manifest_sha256: 'b'.repeat(64), bytes: stableBytes('v0.2.3', 'b'.repeat(64)) }
+
+  await assert.rejects(
+    publisher.writeStable(stable, current),
+    (error) => {
+      assert.equal(error.code, 'invalid-precondition')
+      assert.equal(error.diagnostics.precondition.quoted, false)
+      assert.doesNotMatch(sanitizeError(error), /unquoted-secret/)
+      return true
+    },
+  )
+  assert.equal(signedPuts, 0)
 })
 
 test('resolves a conditional exact-write 5xx by matching signed metadata and bytes', async () => {
@@ -475,6 +554,41 @@ test('rollback promotes an already verified immutable release without replacing 
   assert.deepEqual(fake.objects.get('channels/stable.json').bytes, stableBytes('v0.2.2', old.manifest_sha256))
   assert.deepEqual(fake.objects.get('downloads/v0.2.3/install.sh').bytes, current.assets['install.sh'])
   assert.equal(fake.publicCalls.length, 0)
+})
+
+test('rollback shares stable 412 compensation for a different trusted target', async () => {
+  const oldDirectory = await createReleaseAssets('v0.2.2')
+  const currentDirectory = await createReleaseAssets('v0.2.3')
+  const fake = fakeR2()
+  const old = await validateAssets(oldDirectory, 'v0.2.2')
+  const current = await validateAssets(currentDirectory, 'v0.2.3')
+  for (const [version, inventory] of [['v0.2.2', old], ['v0.2.3', current]]) {
+    for (const asset of RELEASE_ASSETS) {
+      fake.objects.set(`downloads/${version}/${asset}`, {
+        bytes: inventory.assets[asset],
+        headers: { 'content-type': CONTENT_TYPES[asset], 'cache-control': CACHE_CONTROL.immutable },
+        etag: `"${version}-${asset}"`,
+      })
+    }
+  }
+  fake.objects.set('channels/stable.json', {
+    bytes: stableBytes('v0.2.3', current.manifest_sha256),
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': CACHE_CONTROL.mutable },
+    etag: '"current-stable"',
+  })
+  fake.setStablePutHook(() => new Response(null, { status: 412 }))
+
+  await assert.rejects(
+    fake.publisher.rollback('v0.2.2'),
+    (error) => {
+      assert.match(error.message, /stable index changed/)
+      assert.equal(error.diagnostics.classification, 'state-changed')
+      return true
+    },
+  )
+  for (const asset of RELEASE_ASSETS) {
+    assert.deepEqual(fake.objects.get(`downloads/latest/${asset}`).bytes, current.assets[asset])
+  }
 })
 
 test('signed immutable read-back fails closed on metadata, byte, and missing-object mismatches', async () => {
