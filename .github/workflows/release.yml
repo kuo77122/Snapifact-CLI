@@ -9,6 +9,14 @@ on:
         description: Canonical release tag to rehearse in preview
         required: true
         type: string
+      operation:
+        description: Preview rehearsal or the one-time v0.2.3 provenance backfill
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - legacy-backfill
 
 permissions:
   contents: read
@@ -57,6 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -89,24 +98,98 @@ jobs:
           dist/snapifact_linux_amd64 dist/snapifact_linux_arm64
           dist/snapifact_darwin_amd64 dist/snapifact_darwin_arm64
           dist/SHA256SUMS dist/install.sh
-      - name: Download and revalidate exact draft assets
+      - id: draft_assets
+        name: Download and revalidate exact draft assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           verify_dir=$(mktemp -d "$RUNNER_TEMP/release-assets.XXXXXX")
-          trap 'rm -rf "$verify_dir"' EXIT
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir" --clobber
           ./scripts/validate-release.sh "$verify_dir"
+          digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            printf '%s=%s,' "$asset" "$(sha256sum "$verify_dir/$asset" | cut -d " " -f1)"
+          done)
+          digest_set=${digest_set%,}
+          printf 'directory=%s\n' "$verify_dir" >> "$GITHUB_OUTPUT"
+          printf 'digest_set=%s\n' "$digest_set" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Canonical release provenance\n\n- artifact name: `release-provenance-%s`\n- tag SHA: `%s`\n- asset digests: `%s`\n' "$GITHUB_REF_NAME" "$GITHUB_SHA" "$digest_set"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - id: provenance_artifact
+        name: Upload immutable release provenance artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-provenance-${{ github.ref_name }}
+          path: ${{ steps.draft_assets.outputs.directory }}
+          if-no-files-found: error
+          include-hidden-files: false
+      - name: Expose uploaded artifact provenance
+        run: |
+          printf '### Uploaded release provenance\n\n- artifact ID: `%s`\n- artifact digest: `%s`\n- tag SHA: `%s`\n- asset digests: `%s`\n' \
+            "${{ steps.provenance_artifact.outputs.artifact-id }}" \
+            "${{ steps.provenance_artifact.outputs.artifact-digest }}" \
+            "$GITHUB_SHA" "${{ steps.draft_assets.outputs.digest_set }}" >> "$GITHUB_STEP_SUMMARY"
+
+  backfill-v023:
+    name: Backfill v0.2.3 provenance artifact
+    needs: verify
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && inputs.operation == 'legacy-backfill' && inputs.version == 'v0.2.3' && needs.verify.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      LEGACY_VERSION: v0.2.3
+      LEGACY_TAG_SHA: 8ece01f324f5d6f37a120b5efcbb3796fa6eab6e
+      LEGACY_RECORD: release-provenance/v0.2.3.json
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: refs/tags/v0.2.3
+          fetch-depth: 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - id: legacy_assets
+        name: Rebuild and compare recorded v0.2.3 bytes
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$LEGACY_TAG_SHA"
+          test "$(git rev-parse 'refs/tags/v0.2.3^{commit}')" = "$LEGACY_TAG_SHA"
+          GITHUB_REF=refs/tags/v0.2.3 GITHUB_REF_NAME=v0.2.3 GITHUB_SHA="$LEGACY_TAG_SHA" ./scripts/build-release.sh v0.2.3
+          ./scripts/validate-release.sh dist
+          for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            actual=$(sha256sum "dist/$asset" | cut -d ' ' -f1)
+            expected=$(jq -r --arg asset "$asset" '.asset_digests[$asset]' "$LEGACY_RECORD")
+            [[ "$actual" == "$expected" ]] || { printf 'legacy digest mismatch: %s\n' "$asset" >&2; exit 1; }
+          done
+          {
+            printf '### Legacy release provenance\n\n- artifact name: `release-provenance-v0.2.3`\n- tag SHA: `%s`\n' "$LEGACY_TAG_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf 'directory=dist\n' >> "$GITHUB_OUTPUT"
+      - id: provenance_artifact
+        name: Upload immutable v0.2.3 provenance artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-provenance-v0.2.3
+          path: ${{ steps.legacy_assets.outputs.directory }}
+          if-no-files-found: error
+          include-hidden-files: false
 
   preflight:
     name: Preflight preview release provenance
     needs: verify
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && inputs.operation == 'preview' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     outputs:
       tag_sha: ${{ steps.provenance.outputs.tag_sha }}
+      run_id: ${{ steps.provenance.outputs.run_id }}
+      artifact_id: ${{ steps.provenance.outputs.artifact_id }}
+      artifact_digest: ${{ steps.provenance.outputs.artifact_digest }}
+      artifact_name: ${{ steps.provenance.outputs.artifact_name }}
       digest_set: ${{ steps.digests.outputs.digest_set }}
     env:
       RELEASE_VERSION: ${{ inputs.version }}
@@ -126,48 +209,87 @@ jobs:
       - name: Install publication dependencies
         run: npm ci
       - id: provenance
-        name: Prove canonical tag and exact draft assets
+        name: Select one immutable release provenance source
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/release-assets
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION")
           tag_type=$(jq -r '.object.type' <<<"$tag_ref")
           tag_sha=$(jq -r '.object.sha' <<<"$tag_ref")
-          if [[ "$tag_type" == tag ]]; then
-            tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
-          fi
-          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
-          release_json=$(gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft,assets)
-          [[ "$(jq -r '.isDraft' <<<"$release_json")" == true ]]
-          expected=$'SHA256SUMS\ninstall.sh\nsnapifact_darwin_amd64\nsnapifact_darwin_arm64\nsnapifact_linux_amd64\nsnapifact_linux_arm64'
-          actual=$(jq -r '.assets[].name' <<<"$release_json" | sort)
-          [[ "$actual" == "$expected" ]]
-          printf 'tag_sha=%s\n' "$tag_sha" >> "$GITHUB_OUTPUT"
+           if [[ "$tag_type" == tag ]]; then
+             tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
+           fi
+           [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
+           if [[ "$RELEASE_VERSION" == v0.2.3 ]]; then
+             [[ "$tag_sha" == 8ece01f324f5d6f37a120b5efcbb3796fa6eab6e ]]
+           fi
+           artifact_name="release-provenance-$RELEASE_VERSION"
+           if [[ "$RELEASE_VERSION" == v0.2.3 ]]; then event_filter=workflow_dispatch; else event_filter=push; fi
+           run_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=$event_filter&status=success&per_page=100")
+           candidate_runs=$(jq -s --arg version "$RELEASE_VERSION" --arg tag_sha "$tag_sha" '[.[].workflow_runs[] | select(.status == "completed" and .conclusion == "success") | select(if $version == "v0.2.3" then .event == "workflow_dispatch" and .head_branch == "main" else .event == "push" and .head_branch == $version and .head_sha == $tag_sha end)]' <<<"$run_pages")
+           mapfile -t run_ids < <(jq -r '.[].id' <<<"$candidate_runs")
+           source_runs=()
+           for run_id in "${run_ids[@]}"; do
+             artifact_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100")
+             matching=$(jq -s --arg name "$artifact_name" '[.[].artifacts[] | select(.name == $name and .expired == false)]' <<<"$artifact_pages")
+             matching_count=$(jq 'length' <<<"$matching")
+             [[ "$matching_count" -le 1 ]] || { echo 'ambiguous provenance artifacts' >&2; exit 1; }
+             [[ "$matching_count" -eq 1 ]] && source_runs+=("$run_id")
+           done
+           [[ "${#source_runs[@]}" -eq 1 ]] || { echo 'provenance source count is not exactly one' >&2; exit 1; }
+           run_id=${source_runs[0]}
+           run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+           [[ "$(jq -r '.status' <<<"$run_json")" == completed ]]
+           [[ "$(jq -r '.conclusion' <<<"$run_json")" == success ]]
+           [[ "$(jq -r '.actor.login' <<<"$run_json")" == "$GITHUB_REPOSITORY_OWNER" ]]
+           if [[ "$RELEASE_VERSION" == v0.2.3 ]]; then
+             [[ "$(jq -r '.event' <<<"$run_json")" == workflow_dispatch ]]
+             [[ "$(jq -r '.head_branch' <<<"$run_json")" == main ]]
+           else
+             [[ "$(jq -r '.event' <<<"$run_json")" == push ]]
+             [[ "$(jq -r '.head_branch' <<<"$run_json")" == "$RELEASE_VERSION" ]]
+             [[ "$(jq -r '.head_sha' <<<"$run_json")" == "$tag_sha" ]]
+           fi
+           artifact_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100")
+           matching=$(jq -s --arg name "$artifact_name" '[.[].artifacts[] | select(.name == $name and .expired == false)]' <<<"$artifact_pages")
+           [[ "$(jq 'length' <<<"$matching")" -eq 1 ]]
+           artifact_id=$(jq -r '.[0].id' <<<"$matching")
+           artifact_digest=$(jq -r '.[0].digest' <<<"$matching")
+           [[ "$artifact_id" =~ ^[0-9]+$ ]]
+           [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+           archive="$RUNNER_TEMP/$artifact_name.zip"
+           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$archive"
+           [[ "sha256:$(sha256sum "$archive" | cut -d ' ' -f1)" == "$artifact_digest" ]]
+           rm -rf "$RELEASE_ASSETS_DIR"
+           mkdir -p "$RELEASE_ASSETS_DIR"
+           unzip -q "$archive" -d "$RELEASE_ASSETS_DIR"
+           ./scripts/validate-release.sh "$RELEASE_ASSETS_DIR"
+           node --input-type=module -e '
+             import { validateAssets } from "./scripts/publish-r2.mjs"
+             await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
+           '
+           printf 'tag_sha=%s\n' "$tag_sha" >> "$GITHUB_OUTPUT"
+           printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+           printf 'artifact_id=%s\n' "$artifact_id" >> "$GITHUB_OUTPUT"
+           printf 'artifact_digest=%s\n' "$artifact_digest" >> "$GITHUB_OUTPUT"
+           printf 'artifact_name=%s\n' "$artifact_name" >> "$GITHUB_OUTPUT"
+           printf 'directory=%s\n' "$RELEASE_ASSETS_DIR" >> "$GITHUB_OUTPUT"
+           printf '### Preview provenance source\n\n- run ID: `%s`\n- artifact name: `%s`\n- artifact digest: `%s`\n- tag SHA: `%s`\n' "$run_id" "$artifact_name" "$artifact_digest" "$tag_sha" >> "$GITHUB_STEP_SUMMARY"
       - id: digests
-        name: Validate release bytes and record sanitized digests
+        name: Expose sanitized release digests
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_ASSETS_DIR: ${{ runner.temp }}/release-assets
+          RELEASE_ASSETS_DIR: ${{ steps.provenance.outputs.directory }}
         shell: bash
         run: |
-          mkdir -p "$RELEASE_ASSETS_DIR"
-          for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
-            gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS_DIR" --pattern "$asset"
-          done
-          node --input-type=module -e '
-            import { validateAssets } from "./scripts/publish-r2.mjs"
-            await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
-          '
-          digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
-            printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
-          done)
-          digest_set=${digest_set%,}
-          printf 'digest_set=%s\n' "$digest_set" >> "$GITHUB_OUTPUT"
-          {
-            printf '### Preview release provenance\n\n- tag SHA: `%s`\n- asset digests: `%s`\n' "${{ steps.provenance.outputs.tag_sha }}" "$digest_set"
-          } >> "$GITHUB_STEP_SUMMARY"
+           digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+             printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
+           done)
+           digest_set=${digest_set%,}
+           printf 'digest_set=%s\n' "$digest_set" >> "$GITHUB_OUTPUT"
+           [[ -n "$digest_set" ]]
 
   preview-r2-rehearsal:
     name: Rehearse R2 publication in preview
@@ -180,9 +302,14 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
+      actions: read
     env:
       RELEASE_VERSION: ${{ inputs.version }}
       PREFLIGHT_TAG_SHA: ${{ needs.preflight.outputs.tag_sha }}
+      PREFLIGHT_RUN_ID: ${{ needs.preflight.outputs.run_id }}
+      PREFLIGHT_ARTIFACT_ID: ${{ needs.preflight.outputs.artifact_id }}
+      PREFLIGHT_ARTIFACT_DIGEST: ${{ needs.preflight.outputs.artifact_digest }}
+      PREFLIGHT_ARTIFACT_NAME: ${{ needs.preflight.outputs.artifact_name }}
       PREFLIGHT_DIGEST_SET: ${{ needs.preflight.outputs.digest_set }}
     steps:
       - name: Validate canonical release version
@@ -200,7 +327,7 @@ jobs:
       - name: Install publication dependencies
         run: npm ci
       - id: assets
-        name: Re-download and independently revalidate release bytes
+        name: Independently select and revalidate release provenance
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ASSETS_DIR: ${{ runner.temp }}/preview-release-assets
@@ -210,31 +337,57 @@ jobs:
           tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION")
           tag_type=$(jq -r '.object.type' <<<"$tag_ref")
           tag_sha=$(jq -r '.object.sha' <<<"$tag_ref")
-          if [[ "$tag_type" == tag ]]; then
-            tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
-          fi
-          [[ "$tag_sha" == "$PREFLIGHT_TAG_SHA" ]]
-          [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
-          release_json=$(gh release view "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft,assets)
-          [[ "$(jq -r '.isDraft' <<<"$release_json")" == true ]]
-          expected=$'SHA256SUMS\ninstall.sh\nsnapifact_darwin_amd64\nsnapifact_darwin_arm64\nsnapifact_linux_amd64\nsnapifact_linux_arm64'
-          actual=$(jq -r '.assets[].name' <<<"$release_json" | sort)
-          [[ "$actual" == "$expected" ]]
-          rm -rf "$RELEASE_ASSETS_DIR"
-          mkdir -p "$RELEASE_ASSETS_DIR"
-          for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
-            gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS_DIR" --pattern "$asset"
-          done
-          node --input-type=module -e '
-            import { validateAssets } from "./scripts/publish-r2.mjs"
-            await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
+           if [[ "$tag_type" == tag ]]; then
+             tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
+           fi
+           [[ "$tag_sha" == "$PREFLIGHT_TAG_SHA" ]]
+           [[ "$tag_sha" =~ ^[0-9a-f]{40}$ ]]
+           artifact_name="release-provenance-$RELEASE_VERSION"
+           [[ "$artifact_name" == "$PREFLIGHT_ARTIFACT_NAME" ]]
+           if [[ "$RELEASE_VERSION" == v0.2.3 ]]; then event_filter=workflow_dispatch; else event_filter=push; fi
+           run_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=$event_filter&status=success&per_page=100")
+           candidate_runs=$(jq -s --arg version "$RELEASE_VERSION" --arg tag_sha "$tag_sha" '[.[].workflow_runs[] | select(.status == "completed" and .conclusion == "success") | select(if $version == "v0.2.3" then .event == "workflow_dispatch" and .head_branch == "main" else .event == "push" and .head_branch == $version and .head_sha == $tag_sha end)]' <<<"$run_pages")
+           mapfile -t run_ids < <(jq -r '.[].id' <<<"$candidate_runs")
+           source_runs=()
+           for run_id in "${run_ids[@]}"; do
+             artifact_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100")
+             matching=$(jq -s --arg name "$artifact_name" '[.[].artifacts[] | select(.name == $name and .expired == false)]' <<<"$artifact_pages")
+             matching_count=$(jq 'length' <<<"$matching")
+             [[ "$matching_count" -le 1 ]] || { echo 'ambiguous provenance artifacts' >&2; exit 1; }
+             [[ "$matching_count" -eq 1 ]] && source_runs+=("$run_id")
+           done
+           [[ "${#source_runs[@]}" -eq 1 ]] || { echo 'provenance source count is not exactly one' >&2; exit 1; }
+           run_id=${source_runs[0]}
+           run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+           [[ "$(jq -r '.status' <<<"$run_json")" == completed ]]
+           [[ "$(jq -r '.conclusion' <<<"$run_json")" == success ]]
+           [[ "$(jq -r '.actor.login' <<<"$run_json")" == "$GITHUB_REPOSITORY_OWNER" ]]
+           [[ "$(jq -r '.head_branch' <<<"$run_json")" == main || "$(jq -r '.head_branch' <<<"$run_json")" == "$RELEASE_VERSION" ]]
+           artifact_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100")
+           matching=$(jq -s --arg name "$artifact_name" '[.[].artifacts[] | select(.name == $name and .expired == false)]' <<<"$artifact_pages")
+           [[ "$(jq 'length' <<<"$matching")" -eq 1 ]]
+           artifact_id=$(jq -r '.[0].id' <<<"$matching")
+           artifact_digest=$(jq -r '.[0].digest' <<<"$matching")
+           [[ "$artifact_id" =~ ^[0-9]+$ ]]
+           [[ "$artifact_digest" == "$PREFLIGHT_ARTIFACT_DIGEST" ]]
+           archive="$RUNNER_TEMP/$artifact_name.zip"
+           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$archive"
+           [[ "sha256:$(sha256sum "$archive" | cut -d ' ' -f1)" == "$artifact_digest" ]]
+           rm -rf "$RELEASE_ASSETS_DIR"
+           mkdir -p "$RELEASE_ASSETS_DIR"
+           unzip -q "$archive" -d "$RELEASE_ASSETS_DIR"
+           node --input-type=module -e '
+             import { validateAssets } from "./scripts/publish-r2.mjs"
+             await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
           '
           digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
             printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
-          done)
-          digest_set=${digest_set%,}
-          [[ "$digest_set" == "$PREFLIGHT_DIGEST_SET" ]]
-          printf 'directory=%s\n' "$RELEASE_ASSETS_DIR" >> "$GITHUB_OUTPUT"
+           done)
+           digest_set=${digest_set%,}
+           [[ "$run_id" == "$PREFLIGHT_RUN_ID" ]]
+           [[ "$artifact_id" == "$PREFLIGHT_ARTIFACT_ID" ]]
+           [[ "$digest_set" == "$PREFLIGHT_DIGEST_SET" ]]
+           printf 'directory=%s\n' "$RELEASE_ASSETS_DIR" >> "$GITHUB_OUTPUT"
       - name: Publish, verify, matching retry, rollback, and final verify
         env:
           SNAPIFACT_R2_ACCESS_KEY_ID: ${{ secrets.SNAPIFACT_R2_ACCESS_KEY_ID }}
