@@ -7,7 +7,7 @@ on:
     inputs:
       version:
         description: Canonical release tag to rehearse in preview
-        required: true
+        required: false
         type: string
       operation:
         description: Preview rehearsal or the one-time v0.2.3 provenance backfill
@@ -17,6 +17,7 @@ on:
         options:
           - preview
           - legacy-backfill
+          - stable-diagnostic
 
 permissions:
   contents: read
@@ -411,3 +412,48 @@ jobs:
           node scripts/publish-r2.mjs verify --version "$RELEASE_VERSION"
           node scripts/publish-r2.mjs rollback --version "$RELEASE_VERSION"
           node scripts/publish-r2.mjs verify --version "$RELEASE_VERSION"
+
+  stable-diagnostic:
+    name: Diagnose signed Preview stable ETag
+    needs: verify
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == github.repository_owner && inputs.operation == 'stable-diagnostic' && needs.verify.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: r2-release-preview
+    concurrency:
+      group: snapifact-r2-preview-publication
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Prove dispatch source is repository main
+        shell: bash
+        run: |
+          test "$GITHUB_REPOSITORY" = "kuo77122/Snapifact-CLI"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          dispatch_main=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          fetched_main=$(git rev-parse refs/remotes/origin/main)
+          [[ "$dispatch_main" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$fetched_main" =~ ^[0-9a-f]{40}$ ]]
+          test "$dispatch_main" = "$fetched_main"
+          test "$dispatch_main" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.4.0
+          cache: npm
+      - name: Install diagnostic dependency
+        run: npm ci
+      - name: Read stable validator diagnostic
+        env:
+          SNAPIFACT_R2_ACCESS_KEY_ID: ${{ secrets.SNAPIFACT_R2_ACCESS_KEY_ID }}
+          SNAPIFACT_R2_SECRET_ACCESS_KEY: ${{ secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY }}
+          SNAPIFACT_R2_ACCOUNT_ID: ${{ vars.SNAPIFACT_R2_ACCOUNT_ID }}
+          SNAPIFACT_R2_BUCKET: ${{ vars.SNAPIFACT_R2_BUCKET }}
+          SNAPIFACT_R2_PUBLIC_ORIGIN: ${{ vars.SNAPIFACT_R2_PUBLIC_ORIGIN }}
+        run: node scripts/publish-r2.mjs stable-diagnostic
