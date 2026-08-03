@@ -141,8 +141,13 @@ jobs:
     env:
       LEGACY_VERSION: v0.2.3
       LEGACY_TAG_SHA: 8ece01f324f5d6f37a120b5efcbb3796fa6eab6e
-      LEGACY_RECORD: release-provenance/v0.2.3.json
+      LEGACY_RECORD: trusted-source/release-provenance/v0.2.3.json
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-source
+          fetch-depth: 1
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: refs/tags/v0.2.3
