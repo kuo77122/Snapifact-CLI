@@ -1,9 +1,63 @@
-# Preview R2 rehearsal
+# R2 publication boundaries
 
 This repository contains the fixed-key publication helper, one protected
 Preview rehearsal, and one protected signed-read-only stable validator
 diagnostic. Local and contributor workflows never resolve R2 credentials or
 send signed requests.
+
+## Dormant Production boundary
+
+FAT-483 adds a complete but inert Production path. Its explicit `false &&`
+guard is the first condition of the job predicate, so the job and its
+downstream finalizer are skipped on every current event. The remaining
+predicates are deliberately narrow: the repository owner must push a canonical
+`vMAJOR.MINOR.PATCH` tag to `kuo77122/Snapifact-CLI`, verification must pass,
+and the draft publication job must succeed. Pull requests, forks, branches,
+manual inputs, mutable refs, and failed dependencies cannot select it.
+
+The dormant job is bound literally to `r2-release-production`, uses a
+non-canceling concurrency group, and has only `contents: read` and
+`actions: read`. It checks out the exact event SHA and proves the tag commit,
+then downloads only the current run's provenance artifact by the publish-job
+output ID. It checks the artifact run, name, expiration state, platform digest,
+fresh archive digest, exact six-file inventory, installer pin, and recomputed
+asset digest set before accessing the protected environment.
+
+The one credential-bearing publication step first reads the canonical public
+`channels/stable.json` index, requires exactly `version` and `manifest_sha256`,
+and verifies that previously stable version with the fixed helper. It publishes
+the candidate once, marks mutation success only after that command returns, and
+then verifies the candidate. Credential-free smoke fetches the canonical
+versioned installer, installs into a temporary directory, checks exact
+`snapifact vMAJOR.MINOR.PATCH` output, and runs the matching `go install`
+version check. If verification or smoke fails after a successful publish,
+exactly one compensation step rolls back to the previously verified stable
+version and verifies it. The candidate is never retried.
+
+The separate finalizer has only `contents: write` and no Production environment
+or R2 values. It runs only after Production succeeds, rechecks the matching
+draft Release, canonical tag and event SHA, exact six assets, and digest set,
+then undrafts that one release. It has no `always()` or bypass path. Any
+finalizer failure leaves the Release draft and requires a separately approved
+finalize-or-rollback decision.
+
+### Activation prerequisites and recovery
+
+Before FAT-484 activation, the owner must select the canonical version and
+revalidate the literal `r2-release-production` environment: required owner
+review, admin bypass disabled, deployment policies `main` and `v*`, and only
+the approved three variable names and two secret names. The repository must
+also have immutable tag and required-check protection configured and verified;
+the current repository has no ruleset and `main` is unprotected. FAT-512 must
+merge before FAT-484 so Core retains a trustworthy rollback helper. FAT-484 may
+remove only the reviewed inert guard and update its contract assertion; it must
+not redesign this path.
+
+Record only job, run, artifact, SHA, six digest, command outcome, and
+convergence evidence. Never record secret values, signed material, URLs with
+credentials, raw response bodies, or asset bytes. This ticket performs no
+dispatch, approval, credential access, signed request, Production mutation,
+public deployment, tag or Release action, or merge.
 
 ## Before dispatch
 
