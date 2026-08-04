@@ -22,6 +22,7 @@ import {
   parseArguments,
   sanitizeError,
   stableBytes,
+  STABLE_CONTENT_TYPE,
   validateAssets,
 } from './publish-r2.mjs'
 
@@ -206,6 +207,7 @@ function fakeR2() {
   const publicCalls = []
   let etagNumber = 0
   let stablePutHook = null
+  let stableProofHook = null
   const putFailures = new Map()
 
   function keyFrom(url) {
@@ -235,7 +237,8 @@ function fakeR2() {
       }
       const headers = new Headers(init?.headers)
       if (headers.get('if-none-match') === '*' && object) return response(412)
-      if (headers.get('if-match') && (!object || headers.get('if-match') !== object.etag)) return response(412)
+      const candidate = headers.get('if-match')
+      if (candidate && (!object || (candidate !== object.etag && !(key === 'channels/stable.json' && `W/${candidate}` === object.etag)))) return response(412)
       const body = new Uint8Array(init.body)
       const stored = {
         bytes: body,
@@ -249,6 +252,12 @@ function fakeR2() {
       if (failure) return response(failure.status, stored)
       return response(200, stored)
     }
+    if (method === 'GET' && key === 'channels/stable.json' && new Headers(init?.headers).has('if-match')) {
+      if (stableProofHook) return stableProofHook({ key, init, object })
+      const headers = new Headers(init?.headers)
+      const candidate = headers.get('if-match')
+      if (!object || (candidate !== object.etag && `W/${candidate}` !== object.etag)) return response(412)
+    }
     if (!object) return response(404)
     return response(200, object, method === 'GET')
   }
@@ -258,6 +267,7 @@ function fakeR2() {
     signedCalls,
     publicCalls,
     setStablePutHook(hook) { stablePutHook = hook },
+    setStableProofHook(hook) { stableProofHook = hook },
     setPutFailure(key, status, { persist = false } = {}) { putFailures.set(key, { status, persist }) },
     publisher: new R2Publisher({
       s3Origin: 'https://account.example/bucket',
@@ -295,6 +305,138 @@ test('publishes exact objects, refreshes latest in order, and commits stable las
   assert.equal(puts[0].headers.get('cache-control'), CACHE_CONTROL.immutable)
   assert.equal(puts[6].headers.get('cache-control'), CACHE_CONTROL.mutable)
   assert.equal(puts[12].headers.get('if-none-match'), '*')
+})
+
+test('proves a weak stable ETag before mutation and reuses its exact candidate', async () => {
+  const oldDirectory = await createReleaseAssets('v0.2.2')
+  const newDirectory = await createReleaseAssets('v0.2.3')
+  const fake = fakeR2()
+  const old = await validateAssets(oldDirectory, 'v0.2.2')
+  fake.objects.set('channels/stable.json', {
+    bytes: stableBytes('v0.2.2', old.manifest_sha256),
+    headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+    etag: 'W/"old-stable"',
+  })
+
+  await fake.publisher.publish('v0.2.3', newDirectory)
+
+  const stableGets = fake.signedCalls.filter(({ method, key }) => method === 'GET' && key === 'channels/stable.json')
+  const firstMutation = fake.signedCalls.findIndex(({ method }) => method === 'PUT')
+  assert.equal(stableGets.length >= 2, true)
+  assert.equal(stableGets[1].headers.get('if-match'), '"old-stable"')
+  assert.equal(fake.signedCalls.indexOf(stableGets[1]) < firstMutation, true)
+  const stablePut = fake.signedCalls.find(({ method, key }) => method === 'PUT' && key === 'channels/stable.json')
+  assert.equal(stablePut.headers.get('if-match'), '"old-stable"')
+})
+
+test('stops before mutation when weak stable ETag proof fails', async () => {
+  const scenarios = [
+    ['404', () => new Response(null, { status: 404 }), 'not-found'],
+    ['412', () => new Response(null, { status: 412 }), 'precondition-failed'],
+    ['error', () => { throw new Error('private transport detail') }, 'request-failed'],
+    ['metadata', ({ object }) => new Response(object.bytes, {
+      status: 200,
+      headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': 'public, max-age=1' },
+    }), 'metadata-mismatch'],
+    ['schema', ({ object }) => new Response(new TextEncoder().encode('{"version":"v0.2.2"}\n'), {
+      status: 200,
+      headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+    }), 'schema-mismatch'],
+    ['bytes', ({ object }) => new Response(stableBytes('v0.2.3', 'b'.repeat(64)), {
+      status: 200,
+      headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+    }), 'body-mismatch'],
+  ]
+
+  for (const [name, proof, classification] of scenarios) {
+    const oldDirectory = await createReleaseAssets('v0.2.2')
+    const newDirectory = await createReleaseAssets('v0.2.3')
+    const fake = fakeR2()
+    const old = await validateAssets(oldDirectory, 'v0.2.2')
+    fake.objects.set('channels/stable.json', {
+      bytes: stableBytes('v0.2.2', old.manifest_sha256),
+      headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+      etag: 'W/"old-stable"',
+    })
+    fake.setStableProofHook(proof)
+
+    await assert.rejects(
+      fake.publisher.publish('v0.2.3', newDirectory),
+      (error) => {
+        assert.equal(error.code, 'invalid-precondition', name)
+        assert.equal(error.diagnostics.proof, classification, name)
+        assert.doesNotMatch(sanitizeError(error), /private transport detail|old-stable/)
+        return true
+      },
+    )
+    assert.equal(fake.signedCalls.some(({ method }) => method === 'PUT'), false, name)
+    assert.deepEqual(
+      fake.signedCalls.filter(({ method, key }) => method === 'GET' && key === 'channels/stable.json').map(({ headers }) => headers.get('if-match')),
+      [null, '"old-stable"'],
+      name,
+    )
+  }
+})
+
+test('rejects unsupported stable ETag shapes before any publication mutation', async () => {
+  for (const etag of ['bare-value', '"a", "b"', 'W/bare-value', 'W/""', '']) {
+    const oldDirectory = await createReleaseAssets('v0.2.2')
+    const newDirectory = await createReleaseAssets('v0.2.3')
+    const fake = fakeR2()
+    const old = await validateAssets(oldDirectory, 'v0.2.2')
+    fake.objects.set('channels/stable.json', {
+      bytes: stableBytes('v0.2.2', old.manifest_sha256),
+      headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+      etag,
+    })
+
+    await assert.rejects(fake.publisher.publish('v0.2.3', newDirectory), (error) => {
+      assert.ok(error.code === 'invalid-precondition' || error.code === 'invalid-stable')
+      assert.doesNotMatch(sanitizeError(error), /bare-value|private/)
+      return true
+    })
+    assert.equal(fake.signedCalls.some(({ method }) => method === 'PUT'), false, etag)
+    assert.equal(fake.signedCalls.filter(({ method, key }) => method === 'GET' && key === 'channels/stable.json').length, 1, etag)
+  }
+})
+
+test('routes a post-proof weak stable 412 through compensation without retrying stable PUT', async () => {
+  const oldDirectory = await createReleaseAssets('v0.2.2')
+  const newDirectory = await createReleaseAssets('v0.2.3')
+  const fake = fakeR2()
+  const old = await validateAssets(oldDirectory, 'v0.2.2')
+  for (const asset of RELEASE_ASSETS) {
+    fake.objects.set(`downloads/v0.2.2/${asset}`, {
+      bytes: old.assets[asset],
+      headers: { 'content-type': CONTENT_TYPES[asset], 'cache-control': CACHE_CONTROL.immutable },
+      etag: `"old-${asset}"`,
+    })
+    fake.objects.set(`downloads/latest/${asset}`, {
+      bytes: old.assets[asset],
+      headers: { 'content-type': CONTENT_TYPES[asset], 'cache-control': CACHE_CONTROL.mutable },
+      etag: `"latest-${asset}"`,
+    })
+  }
+  fake.objects.set('channels/stable.json', {
+    bytes: stableBytes('v0.2.2', old.manifest_sha256),
+    headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+    etag: 'W/"old-stable"',
+  })
+  fake.setStablePutHook(() => {
+    fake.objects.set('channels/stable.json', {
+      bytes: stableBytes('v0.2.2', old.manifest_sha256),
+      headers: { 'content-type': STABLE_CONTENT_TYPE, 'cache-control': CACHE_CONTROL.mutable },
+      etag: '"racing-publisher"',
+    })
+    return new Response(null, { status: 412 })
+  })
+
+  await assert.rejects(fake.publisher.publish('v0.2.3', newDirectory), /stable index changed/)
+  const stableCalls = fake.signedCalls.filter(({ key }) => key === 'channels/stable.json')
+  assert.equal(stableCalls.filter(({ method, headers }) => method === 'GET' && headers.get('if-match') === '"old-stable"').length, 1)
+  assert.equal(stableCalls.filter(({ method }) => method === 'PUT').length, 1)
+  assert.equal(stableCalls.find(({ method }) => method === 'PUT').headers.get('if-match'), '"old-stable"')
+  assert.deepEqual(fake.objects.get('channels/stable.json').bytes, stableBytes('v0.2.2', old.manifest_sha256))
 })
 
 test('publishes from signed GET state without requesting the public origin', async () => {

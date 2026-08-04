@@ -54,6 +54,15 @@ mutually exclusive shape, byte length, and first 12 lowercase SHA-256
 characters of the validator. It never emits the validator, body, URL,
 credentials, headers, account, bucket, or origin.
 
+During publication, a valid weak-quoted stable validator is reduced only by
+removing its exact `W/` prefix. Before any exact or mutable object write, the
+helper performs one signed conditional GET for the same fixed key using that
+candidate. It proceeds only when the response succeeds, has the approved
+stable metadata and canonical schema, and has bytes identical to the initial
+stable read. The unchanged candidate is then used for the final stable PUT;
+proof failures stop without mutation, and a final 412 uses the existing
+compensation path without retrying the stable PUT.
+
 No PR, fork, ordinary push, non-main ref, non-owner dispatch, noncanonical
 version, tag drift, missing/failed/multiple/ambiguous/expired artifact,
 artifact digest drift, inventory drift, or asset digest drift can reach the
