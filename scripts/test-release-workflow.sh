@@ -49,14 +49,17 @@ require "$workflow" 'publish-r2.mjs verify'
 require "$workflow" 'publish-r2.mjs rollback'
 require "$workflow" 'stable-diagnostic'
 require "$workflow" 'node scripts/publish-r2.mjs stable-diagnostic'
+require "$workflow" 'environment: r2-release-production'
+require "$workflow" "if: \${{ false && github.event_name == 'push'"
+require "$workflow" 'needs: [verify, publish]'
+require "$workflow" 'needs: [publish-production, publish]'
+require "$workflow" 'gh release edit "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false'
+require "$workflow" 'mutation_succeeded=true'
 
-if [[ "$workflow" == *'r2-release-production'* || "$workflow" == *'production'* ]]; then
-	fail 'production publication boundary is referenced'
-fi
 if [[ "$workflow" == *'inputs.environment'* || "$workflow" == *'inputs.bucket'* || "$workflow" == *'inputs.public_origin'* ]]; then
 	fail 'generic environment selector is present'
 fi
-if [[ "$workflow" == *'gh release edit'* || "$workflow" == *'gh release delete'* || "$workflow" == *' list '* || "$workflow" == *' delete '* ]]; then
+if [[ "$workflow" == *'gh release delete'* || "$workflow" == *' list '* || "$workflow" == *' delete '* ]]; then
 	fail 'release mutation or arbitrary object interface is present'
 fi
 

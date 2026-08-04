@@ -64,6 +64,13 @@ jobs:
     if: ${{ github.event_name == 'push' && needs.verify.result == 'success' && needs.verify.outputs.canonical_tag == 'true' }}
     needs: verify
     runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ github.run_id }}
+      tag_sha: ${{ github.sha }}
+      artifact_id: ${{ steps.provenance_artifact.outputs.artifact-id }}
+      artifact_digest: ${{ steps.provenance_artifact.outputs.artifact-digest }}
+      artifact_name: release-provenance-${{ github.ref_name }}
+      digest_set: ${{ steps.draft_assets.outputs.digest_set }}
     permissions:
       contents: write
       actions: write
@@ -130,6 +137,168 @@ jobs:
             "${{ steps.provenance_artifact.outputs.artifact-id }}" \
             "${{ steps.provenance_artifact.outputs.artifact-digest }}" \
             "$GITHUB_SHA" "${{ steps.draft_assets.outputs.digest_set }}" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-production:
+    name: Publish Production release
+    if: ${{ false && github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'kuo77122/Snapifact-CLI' && github.actor == github.repository_owner && needs.verify.result == 'success' && needs.publish.result == 'success' && needs.verify.outputs.canonical_tag == 'true' }}
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    environment: r2-release-production
+    concurrency:
+      group: snapifact-r2-production-publication
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+      PRODUCTION_RUN_ID: ${{ needs.publish.outputs.run_id }}
+      PRODUCTION_TAG_SHA: ${{ needs.publish.outputs.tag_sha }}
+      PRODUCTION_ARTIFACT_ID: ${{ needs.publish.outputs.artifact_id }}
+      PRODUCTION_ARTIFACT_DIGEST: ${{ needs.publish.outputs.artifact_digest }}
+      PRODUCTION_ARTIFACT_NAME: ${{ needs.publish.outputs.artifact_name }}
+      PRODUCTION_DIGEST_SET: ${{ needs.publish.outputs.digest_set }}
+    steps:
+      - name: Validate canonical release version
+        shell: bash
+        run: |
+          [[ "$RELEASE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 26.4.0
+          cache: npm
+      - id: assets
+        name: Revalidate current-run Production provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/production-release-assets
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$PRODUCTION_TAG_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$PRODUCTION_ARTIFACT_ID")
+          [[ "$(jq -r '.id' <<<"$artifact")" == "$PRODUCTION_ARTIFACT_ID" ]]
+          [[ "$(jq -r '.name' <<<"$artifact")" == "$PRODUCTION_ARTIFACT_NAME" ]]
+          [[ "$(jq -r '.expired' <<<"$artifact")" == false ]]
+          [[ "$(jq -r '.workflow_run.id' <<<"$artifact")" == "$PRODUCTION_RUN_ID" ]]
+          [[ "$(jq -r '.digest' <<<"$artifact")" == "$PRODUCTION_ARTIFACT_DIGEST" ]]
+          archive="$RUNNER_TEMP/$PRODUCTION_ARTIFACT_NAME.zip"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$PRODUCTION_ARTIFACT_ID/zip" > "$archive"
+          [[ "sha256:$(sha256sum "$archive" | cut -d ' ' -f1)" == "$PRODUCTION_ARTIFACT_DIGEST" ]]
+          rm -rf "$RELEASE_ASSETS_DIR"
+          mkdir -p "$RELEASE_ASSETS_DIR"
+          unzip -q "$archive" -d "$RELEASE_ASSETS_DIR"
+          ./scripts/validate-release.sh "$RELEASE_ASSETS_DIR"
+          node --input-type=module -e '
+            import { validateAssets } from "./scripts/publish-r2.mjs"
+            await validateAssets(process.env.RELEASE_ASSETS_DIR, process.env.RELEASE_VERSION)
+          '
+          digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
+          done)
+          digest_set=${digest_set%,}
+          [[ "$digest_set" == "$PRODUCTION_DIGEST_SET" ]]
+          printf 'directory=%s\n' "$RELEASE_ASSETS_DIR" >> "$GITHUB_OUTPUT"
+      - id: publish_candidate
+        name: Verify prior stable and publish Production candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPIFACT_R2_ACCESS_KEY_ID: ${{ secrets.SNAPIFACT_R2_ACCESS_KEY_ID }}
+          SNAPIFACT_R2_SECRET_ACCESS_KEY: ${{ secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY }}
+          SNAPIFACT_R2_ACCOUNT_ID: ${{ vars.SNAPIFACT_R2_ACCOUNT_ID }}
+          SNAPIFACT_R2_BUCKET: ${{ vars.SNAPIFACT_R2_BUCKET }}
+          SNAPIFACT_R2_PUBLIC_ORIGIN: ${{ vars.SNAPIFACT_R2_PUBLIC_ORIGIN }}
+          RELEASE_ASSETS_DIR: ${{ steps.assets.outputs.directory }}
+        shell: bash
+        run: |
+          stable_json=$(curl --fail --silent --show-error -- "$SNAPIFACT_R2_PUBLIC_ORIGIN/channels/stable.json")
+          jq -e 'type == "object" and (keys | sort) == ["manifest_sha256", "version"] and (.version | type == "string" and test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and (.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$"))' <<<"$stable_json" >/dev/null
+          PRIOR_VERSION=$(jq -r '.version' <<<"$stable_json")
+          printf 'prior_version=%s\n' "$PRIOR_VERSION" >> "$GITHUB_OUTPUT"
+          node scripts/publish-r2.mjs verify --version "$PRIOR_VERSION"
+          node scripts/publish-r2.mjs publish --version "$RELEASE_VERSION" --assets "$RELEASE_ASSETS_DIR"
+          printf 'mutation_succeeded=true\n' >> "$GITHUB_OUTPUT"
+          node scripts/publish-r2.mjs verify --version "$RELEASE_VERSION"
+      - name: Canonical installer smoke
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install.sh"
+          install_dir=$(mktemp -d "$RUNNER_TEMP/installed.XXXXXX")
+          curl --fail --silent --show-error --location "https://snapifact.dev/downloads/$RELEASE_VERSION/install.sh" > "$installer"
+          SNAPIFACT_VERSION="$RELEASE_VERSION" SNAPIFACT_INSTALL_DIR="$install_dir" sh "$installer"
+          test "$("$install_dir/snapifact" --version)" = "snapifact $RELEASE_VERSION"
+      - name: Go install version smoke
+        shell: bash
+        run: |
+          GOBIN="$RUNNER_TEMP/go-bin" go install "github.com/kuo77122/snapifact-cli/cmd/snapifact@$RELEASE_VERSION"
+          test "$("$RUNNER_TEMP/go-bin/snapifact" --version)" = "snapifact $RELEASE_VERSION"
+      - name: Compensate to previously verified stable release
+        if: ${{ failure() && steps.publish_candidate.outputs.mutation_succeeded == 'true' }}
+        env:
+          SNAPIFACT_R2_ACCESS_KEY_ID: ${{ secrets.SNAPIFACT_R2_ACCESS_KEY_ID }}
+          SNAPIFACT_R2_SECRET_ACCESS_KEY: ${{ secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY }}
+          SNAPIFACT_R2_ACCOUNT_ID: ${{ vars.SNAPIFACT_R2_ACCOUNT_ID }}
+          SNAPIFACT_R2_BUCKET: ${{ vars.SNAPIFACT_R2_BUCKET }}
+          SNAPIFACT_R2_PUBLIC_ORIGIN: ${{ vars.SNAPIFACT_R2_PUBLIC_ORIGIN }}
+        shell: bash
+        run: |
+          node scripts/publish-r2.mjs rollback --version "${{ steps.publish_candidate.outputs.prior_version }}"
+          node scripts/publish-r2.mjs verify --version "${{ steps.publish_candidate.outputs.prior_version }}"
+
+  finalize-production-release:
+    name: Finalize Production draft release
+    if: ${{ needs.publish-production.result == 'success' }}
+    needs: [publish-production, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+      EXPECTED_DIGEST_SET: ${{ needs.publish.outputs.digest_set }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Revalidate matching draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSETS_DIR: ${{ runner.temp }}/finalize-release-assets
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION")
+          tag_type=$(jq -r '.object.type' <<<"$tag_ref")
+          tag_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+          if [[ "$tag_type" == tag ]]; then
+            tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
+          fi
+          test "$tag_sha" = "$GITHUB_SHA"
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION")
+          jq -e --arg version "$RELEASE_VERSION" '(.isDraft == true) and (.tag_name == $version) and ([.assets[].name] | sort) == ["SHA256SUMS", "install.sh", "snapifact_darwin_amd64", "snapifact_darwin_arm64", "snapifact_linux_amd64", "snapifact_linux_arm64"]' <<<"$release" >/dev/null
+          rm -rf "$RELEASE_ASSETS_DIR"
+          mkdir -p "$RELEASE_ASSETS_DIR"
+          gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS_DIR" --clobber
+          ./scripts/validate-release.sh "$RELEASE_ASSETS_DIR"
+          digest_set=$(for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install.sh; do
+            printf '%s=%s,' "$asset" "$(sha256sum "$RELEASE_ASSETS_DIR/$asset" | cut -d " " -f1)"
+          done)
+          digest_set=${digest_set%,}
+          test "$digest_set" = "$EXPECTED_DIGEST_SET"
+          gh release edit "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
 
   backfill-v023:
     name: Backfill v0.2.3 provenance artifact

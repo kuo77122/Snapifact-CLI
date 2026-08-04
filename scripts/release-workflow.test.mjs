@@ -22,6 +22,8 @@ const preflight = jobBlock('preflight')
 const preview = jobBlock('preview-r2-rehearsal')
 const backfill = jobBlock('backfill-v023')
 const diagnostic = jobBlock('stable-diagnostic')
+const production = jobBlock('publish-production')
+const finalizer = jobBlock('finalize-production-release')
 const assets = [
   'snapifact_linux_amd64',
   'snapifact_linux_arm64',
@@ -130,7 +132,7 @@ test('mutation re-downloads into a fresh directory and requires independent prov
 test('only the final credential-bearing step binds approved Preview values', () => {
   const credentialStart = preview.indexOf('      - name: Publish, verify, matching retry, rollback, and final verify')
   assert.ok(credentialStart >= 0)
-  const beforeCredentials = workflow.slice(0, workflow.indexOf('  preview-r2-rehearsal:') + credentialStart)
+  const beforeCredentials = preview.slice(0, credentialStart)
   const credentialStep = preview.slice(credentialStart)
   for (const reference of [
     'secrets.SNAPIFACT_R2_ACCESS_KEY_ID',
@@ -154,10 +156,76 @@ test('ordinary verification and manual dispatch cannot create releases or resolv
   assert.match(publish, /if: \$\{\{ github\.event_name == 'push'/)
   assert.doesNotMatch(publish, /workflow_dispatch/)
   assert.doesNotMatch(verify, /SNAPIFACT_R2_|publish-r2\.mjs/)
-  assert.doesNotMatch(workflow, /r2-release-production|production/i)
+  const nonProductionJobs = `${verify}\n${publish}\n${preflight}\n${backfill}\n${diagnostic}`
+  assert.doesNotMatch(nonProductionJobs, /r2-release-production|production/i)
   assert.doesNotMatch(workflow, /inputs\.(?:environment|bucket|public_origin)/)
-  assert.doesNotMatch(workflow, /gh release (edit|delete)|\b(delete|list)\b/i)
+  assert.doesNotMatch(nonProductionJobs, /gh release (edit|delete)|\b(delete|list)\b/i)
   assert.doesNotMatch(workflow, /Authorization|signature|private endpoint/i)
+})
+
+test('Production publication is inert and reachable only from the canonical tag chain', () => {
+  assert.match(
+    production,
+    /if: \$\{\{ false && github\.event_name == 'push' && github\.ref_type == 'tag' && github\.repository == 'kuo77122\/Snapifact-CLI' && github\.actor == github\.repository_owner && needs\.verify\.result == 'success' && needs\.publish\.result == 'success' && needs\.verify\.outputs\.canonical_tag == 'true' \}\}/,
+  )
+  assert.match(production, /^    needs: \[verify, publish\]$/m)
+  assert.match(production, /^    environment: r2-release-production$/m)
+  assert.match(production, /concurrency:\n      group: snapifact-r2-production-publication\n      cancel-in-progress: false/)
+  assert.match(production, /permissions:\n      contents: read\n      actions: read/)
+  assert.doesNotMatch(production, /always\(\)|workflow_dispatch|inputs\.|github\.ref == 'refs\/heads\//)
+})
+
+test('Production revalidates the current-run provenance and six immutable release assets', () => {
+  assert.match(publish, /tag_sha: \$\{\{ github\.sha \}\}/)
+  assert.match(publish, /artifact_id: \$\{\{ steps\.provenance_artifact\.outputs\.artifact-id \}\}/)
+  assert.match(publish, /artifact_digest: \$\{\{ steps\.provenance_artifact\.outputs\.artifact-digest \}\}/)
+  assert.match(publish, /digest_set: \$\{\{ steps\.draft_assets\.outputs\.digest_set \}\}/)
+  assert.match(production, /actions\/artifacts\/\$PRODUCTION_ARTIFACT_ID\/zip/)
+  assert.match(production, /PRODUCTION_RUN_ID.*needs\.publish\.outputs\.run_id/)
+  assert.match(production, /workflow_run\.id.*PRODUCTION_RUN_ID/)
+  assert.match(production, /sha256sum.*archive/)
+  assert.match(production, /validateAssets/)
+  assert.match(production, /for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install\.sh/)
+  assert.match(production, /digest_set.*PRODUCTION_DIGEST_SET|PRODUCTION_DIGEST_SET.*digest_set/)
+  assert.match(production, /default_version=|RELEASE_VERSION/)
+})
+
+test('Production verifies prior stable, publishes once, and compensates only after publish success', () => {
+  assert.match(production, /channels\/stable\.json/)
+  assert.match(production, /keys \| sort.*manifest_sha256.*version|manifest_sha256.*version.*keys \| sort/)
+  assert.match(production, /node scripts\/publish-r2\.mjs verify --version "\$PRIOR_VERSION"/)
+  assert.match(production, /node scripts\/publish-r2\.mjs publish --version "\$RELEASE_VERSION" --assets "\$RELEASE_ASSETS_DIR"/)
+  assert.match(production, /mutation_succeeded=true/)
+  assert.deepEqual(
+    [...production.matchAll(/node scripts\/publish-r2\.mjs (publish|verify|rollback)/g)].map((match) => match[1]),
+    ['verify', 'publish', 'verify', 'rollback', 'verify'],
+  )
+  assert.match(production, /if: \$\{\{ failure\(\) && steps\.publish_candidate\.outputs\.mutation_succeeded == 'true' \}\}/)
+  assert.doesNotMatch(production, /publish --version "\$RELEASE_VERSION"[^\n]*\n[^\n]*publish --version "\$RELEASE_VERSION"/)
+})
+
+test('Production public smoke is credential-free and finalization is success-gated and revalidated', () => {
+  const smokeStart = production.indexOf('      - name: Canonical installer smoke')
+  assert.ok(smokeStart >= 0)
+  const compensationStart = production.indexOf('      - name: Compensate to previously verified stable release')
+  assert.ok(compensationStart > smokeStart)
+  const smoke = production.slice(smokeStart, compensationStart)
+  assert.match(smoke, /https:\/\/snapifact\.dev\/downloads\/\$RELEASE_VERSION\/install\.sh/)
+  assert.match(smoke, /SNAPIFACT_INSTALL_DIR/)
+  assert.match(smoke, /--version/)
+  assert.match(smoke, /go install .*snapifact@.*RELEASE_VERSION/)
+  assert.doesNotMatch(smoke, /SNAPIFACT_R2_|r2-release-production/)
+
+  assert.match(finalizer, /^    needs: \[publish-production, publish\]$/m)
+  assert.match(finalizer, /if: \$\{\{ needs\.publish-production\.result == 'success' \}\}/)
+  assert.match(finalizer, /permissions:\n      contents: write/)
+  assert.doesNotMatch(finalizer, /actions: write|always\(\)|SNAPIFACT_R2_|r2-release-production/)
+  assert.match(finalizer, /isDraft/)
+  assert.match(finalizer, /gh release download/)
+  assert.match(finalizer, /tag.*GITHUB_SHA|GITHUB_SHA.*tag/)
+  assert.match(finalizer, /for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install\.sh/)
+  assert.match(finalizer, /EXPECTED_DIGEST_SET.*needs\.publish\.outputs\.digest_set/)
+  assert.match(finalizer, /gh release edit "\$RELEASE_VERSION".*--draft=false/)
 })
 
 test('all third-party release actions use reviewed full commit pins', () => {
