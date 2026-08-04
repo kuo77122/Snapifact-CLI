@@ -288,7 +288,7 @@ jobs:
           fi
           test "$tag_sha" = "$GITHUB_SHA"
           release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION")
-          jq -e --arg version "$RELEASE_VERSION" '(.isDraft == true) and (.tag_name == $version) and ([.assets[].name] | sort) == ["SHA256SUMS", "install.sh", "snapifact_darwin_amd64", "snapifact_darwin_arm64", "snapifact_linux_amd64", "snapifact_linux_arm64"]' <<<"$release" >/dev/null
+          jq -e --arg version "$RELEASE_VERSION" '(.draft == true) and (.tag_name == $version) and ([.assets[].name] | sort) == ["SHA256SUMS", "install.sh", "snapifact_darwin_amd64", "snapifact_darwin_arm64", "snapifact_linux_amd64", "snapifact_linux_arm64"]' <<<"$release" >/dev/null
           rm -rf "$RELEASE_ASSETS_DIR"
           mkdir -p "$RELEASE_ASSETS_DIR"
           gh release download "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_ASSETS_DIR" --clobber
