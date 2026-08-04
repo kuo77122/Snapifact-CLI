@@ -208,6 +208,15 @@ function etagDiagnostics(etag) {
   }
 }
 
+function stableProofFailure(classification, status) {
+  fail('invalid-precondition', 'stable ETag candidate proof failed', {
+    diagnostics: {
+      proof: classification,
+      ...(status === undefined ? {} : { status }),
+    },
+  })
+}
+
 function stableConflictError(message, status, { classification, precondition, readback } = {}) {
   return new PublicationError('conditional-conflict', message, {
     status,
@@ -515,6 +524,45 @@ export class R2Publisher {
     }
   }
 
+  async proveStablePrecondition(current) {
+    if (!current) return null
+    if (!current.etag) fail('invalid-stable', 'stable index has no usable ETag')
+    if (ETAG_PATTERN.test(current.etag)) return current
+
+    const candidate = current.etag.startsWith('W/') ? current.etag.slice(2) : null
+    if (!candidate || !ETAG_PATTERN.test(candidate)) {
+      fail('invalid-precondition', 'stable index ETag precondition is malformed', {
+        diagnostics: { precondition: etagDiagnostics(current.etag) },
+      })
+    }
+
+    let response
+    try {
+      response = await this.signedRequest('GET', 'channels/stable.json', {
+        headers: { 'if-match': candidate },
+      })
+    } catch {
+      stableProofFailure('request-failed')
+    }
+    if (!response.ok) {
+      stableProofFailure(
+        response.status === 404 ? 'not-found' : response.status === 412 ? 'precondition-failed' : 'request-failed',
+        response.status,
+      )
+    }
+    if (!validateMetadata(response, stableMetadata())) stableProofFailure('metadata-mismatch', response.status)
+
+    let bytes
+    try {
+      bytes = await responseBytes(response)
+      parseStable(bytes)
+    } catch {
+      stableProofFailure('schema-mismatch', response.status)
+    }
+    if (!bytesEqual(bytes, current.bytes)) stableProofFailure('body-mismatch', response.status)
+    return { ...current, etag: candidate }
+  }
+
   async diagnoseStableETag() {
     try {
       const response = await this.signedRequest('GET', 'channels/stable.json')
@@ -735,6 +783,7 @@ export class R2Publisher {
     const inventory = await validateAssets(assetsDirectory, version)
     const prior = await this.readStableSigned({ allowMissing: true })
     if (prior && compareVersions(version, prior.version) < 0) fail('stale-version', 'version is older than stable')
+    const precondition = await this.proveStablePrecondition(prior)
     for (const asset of RELEASE_ASSETS) await this.putExact(keyForVersion(version, asset), inventory.assets[asset], asset)
     const verified = await this.verifySignedRelease(version)
     const stable = { version, manifest_sha256: verified.manifest_sha256, bytes: stableBytes(version, verified.manifest_sha256) }
@@ -742,7 +791,7 @@ export class R2Publisher {
     try {
       latestStarted = true
       await this.refreshLatest(verified.assets)
-      await this.writeStable(stable, prior)
+      await this.writeStable(stable, precondition)
       await this.verifyConvergence(verified)
       return { version, manifest_sha256: verified.manifest_sha256 }
     } catch (error) {
@@ -771,12 +820,13 @@ export class R2Publisher {
   async rollback(version) {
     const verified = await this.verifySignedRelease(version)
     const prior = await this.readStableSigned({ allowMissing: true })
+    const precondition = await this.proveStablePrecondition(prior)
     let latestStarted = false
     const stable = { version, manifest_sha256: verified.manifest_sha256, bytes: stableBytes(version, verified.manifest_sha256) }
     try {
       latestStarted = true
       await this.refreshLatest(verified.assets)
-      await this.writeStable(stable, prior)
+      await this.writeStable(stable, precondition)
       await this.verifyConvergence(verified)
       return { version, manifest_sha256: verified.manifest_sha256 }
     } catch (error) {
