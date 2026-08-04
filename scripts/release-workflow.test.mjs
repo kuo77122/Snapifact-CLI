@@ -163,11 +163,12 @@ test('ordinary verification and manual dispatch cannot create releases or resolv
   assert.doesNotMatch(workflow, /Authorization|signature|private endpoint/i)
 })
 
-test('Production publication is inert and reachable only from the canonical tag chain', () => {
+test('Production publication is active and reachable only from the canonical tag chain', () => {
   assert.match(
     production,
-    /if: \$\{\{ false && github\.event_name == 'push' && github\.ref_type == 'tag' && github\.repository == 'kuo77122\/Snapifact-CLI' && github\.actor == github\.repository_owner && needs\.verify\.result == 'success' && needs\.publish\.result == 'success' && needs\.verify\.outputs\.canonical_tag == 'true' \}\}/,
+    /if: \$\{\{ github\.event_name == 'push' && github\.ref_type == 'tag' && github\.repository == 'kuo77122\/Snapifact-CLI' && github\.actor == github\.repository_owner && needs\.verify\.result == 'success' && needs\.publish\.result == 'success' && needs\.verify\.outputs\.canonical_tag == 'true' \}\}/,
   )
+  assert.doesNotMatch(production, /false &&/)
   assert.match(production, /^    needs: \[verify, publish\]$/m)
   assert.match(production, /^    environment: r2-release-production$/m)
   assert.match(production, /concurrency:\n      group: snapifact-r2-production-publication\n      cancel-in-progress: false/)

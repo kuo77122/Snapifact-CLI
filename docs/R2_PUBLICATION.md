@@ -5,17 +5,16 @@ Preview rehearsal, and one protected signed-read-only stable validator
 diagnostic. Local and contributor workflows never resolve R2 credentials or
 send signed requests.
 
-## Dormant Production boundary
+## Active Production boundary
 
-FAT-483 adds a complete but inert Production path. Its explicit `false &&`
-guard is the first condition of the job predicate, so the job and its
-downstream finalizer are skipped on every current event. The remaining
-predicates are deliberately narrow: the repository owner must push a canonical
-`vMAJOR.MINOR.PATCH` tag to `kuo77122/Snapifact-CLI`, verification must pass,
-and the draft publication job must succeed. Pull requests, forks, branches,
-manual inputs, mutable refs, and failed dependencies cannot select it.
+FAT-484 activates the reviewed Production path by removing only its inert
+guard. The remaining predicate is deliberately narrow: the repository owner
+must push a canonical `vMAJOR.MINOR.PATCH` tag to `kuo77122/Snapifact-CLI`,
+verification must pass, and the draft publication job must succeed. Pull
+requests, forks, branches, manual inputs, mutable refs, and failed
+dependencies cannot select it.
 
-The dormant job is bound literally to `r2-release-production`, uses a
+The active job is bound literally to `r2-release-production`, uses a
 non-canceling concurrency group, and has only `contents: read` and
 `actions: read`. It checks out the exact event SHA and proves the tag commit,
 then downloads only the current run's provenance artifact by the publish-job
@@ -41,23 +40,63 @@ then undrafts that one release. It has no `always()` or bypass path. Any
 finalizer failure leaves the Release draft and requires a separately approved
 finalize-or-rollback decision.
 
-### Activation prerequisites and recovery
+### Activation gates and recovery
 
-Before FAT-484 activation, the owner must select the canonical version and
-revalidate the literal `r2-release-production` environment: required owner
-review, admin bypass disabled, deployment policies `main` and `v*`, and only
-the approved three variable names and two secret names. The repository must
-also have immutable tag and required-check protection configured and verified;
-the current repository has no ruleset and `main` is unprotected. FAT-512 must
-merge before FAT-484 so Core retains a trustworthy rollback helper. FAT-484 may
-remove only the reviewed inert guard and update its contract assertion; it must
-not redesign this path.
+The candidate for this cutover is `v0.2.4`; the mutable rollback target is the
+currently healthy `v0.2.2`. The existing `v0.2.3` draft and history remain
+untouched. Gates are separate and ordered:
 
-Record only job, run, artifact, SHA, six digest, command outcome, and
-convergence evidence. Never record secret values, signed material, URLs with
-credentials, raw response bodies, or asset bytes. This ticket performs no
-dispatch, approval, credential access, signed request, Production mutation,
-public deployment, tag or Release action, or merge.
+1. Planner proves the merged activation SHA and green configured checks.
+2. The owner separately authorizes and creates/pushes `v0.2.4` at that exact
+   SHA. This workflow does not create tags.
+3. The tag run verifies the tag, builds the six assets, creates one draft
+   Release, revalidates the assets, and uploads one current-run provenance
+   artifact.
+4. Before Production approval, Planner rechecks the tag/run/artifact/SHA,
+   exact six digests, draft identity, and healthy unchanged `v0.2.2` stable
+   state.
+5. The owner separately approves the waiting `r2-release-production`
+   deployment.
+6. The workflow verifies prior stable, publishes once, verifies the candidate,
+   performs the existing credential-free installer and `go install` smoke, and
+   compensates once only if publication succeeded and a later check fails.
+7. The finalizer undrafts the matching Release only after complete Production
+   success.
+
+Repository rulesets and classic `main` protection are intentionally deferred at
+the current single-writer scale. Accepted compensating controls are one
+reviewed PR, current-head review, green `go` and `Verify (ubuntu-latest)`
+checks, exact tag/SHA/provenance gates, and the required Production reviewer.
+Paid immutable-tag and required-check enforcement becomes mandatory before a
+second writer or write-capable automation, before a second standalone
+Production release, or before FAT-485 retires Core rollback ownership.
+
+Calling `publish` may write immutable exact `downloads/v0.2.4/*` objects before
+returning. Rollback never deletes or overwrites exact history; it restores only
+mutable latest/stable to the verified `v0.2.2` state. These outcomes remain
+distinct and require no retry or delete behavior:
+
+- no exact candidate residue and healthy `v0.2.2`: leave the draft and stop;
+- all present exact candidate objects match the approved digests and healthy
+  `v0.2.2`: record irreversible residue, leave the draft, and require a
+  separately approved replan before any same-version rerun or replacement;
+- partial or mismatched exact candidate objects: stop as an immutable-version
+  incident and never overwrite, delete, or reuse `v0.2.4` without a separate
+  recovery decision;
+- unproven prior `v0.2.2` latest/stable: stop and obtain separate owner
+  approval for the FAT-512-aligned Core rollback path;
+- after `mutation_succeeded=true`, allow the existing one-time mutable
+  compensation; failed compensation or finalization leaves the draft and
+  requires a separately approved finalize-or-rollback decision.
+
+Stop on scope drift, changed head, missing or failed checks, a pre-existing
+`v0.2.4` tag/Release/object, unresolved gate timing, unexpected environment or
+credential names, tag/run/artifact/SHA/digest drift, partial or mismatched
+residue, public/signed divergence, latest/stable non-convergence, unavailable
+rollback, or any deployment requirement outside this workflow. Record only
+sanitized job, run, artifact, SHA, digest, command outcome, and convergence
+evidence; never record credentials, private values, raw bodies, signed
+material, URLs with credentials, or asset bytes.
 
 ## Before dispatch
 

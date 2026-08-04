@@ -50,7 +50,10 @@ require "$workflow" 'publish-r2.mjs rollback'
 require "$workflow" 'stable-diagnostic'
 require "$workflow" 'node scripts/publish-r2.mjs stable-diagnostic'
 require "$workflow" 'environment: r2-release-production'
-require "$workflow" "if: \${{ false && github.event_name == 'push'"
+require "$workflow" "if: \${{ github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'kuo77122/Snapifact-CLI' && github.actor == github.repository_owner && needs.verify.result == 'success' && needs.publish.result == 'success' && needs.verify.outputs.canonical_tag == 'true' }}"
+if [[ "$workflow" == *'false &&'* ]]; then
+	fail 'Production publication remains inert'
+fi
 require "$workflow" 'needs: [verify, publish]'
 require "$workflow" 'needs: [publish-production, publish]'
 require "$workflow" 'gh release edit "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false'
