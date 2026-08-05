@@ -196,6 +196,18 @@ test('Production preserves exact REST and downloaded archive digest comparisons'
   assert.match(production, /\[\[ "sha256:\$\(sha256sum "\$archive" \| cut -d ' ' -f1\)" == "\$PRODUCTION_ARTIFACT_DIGEST" \]\]/)
 })
 
+test('Production installs publication dependencies before provenance revalidation', () => {
+  const setupNode = production.indexOf('      - uses: actions/setup-node@')
+  const install = production.indexOf('      - name: Install publication dependencies')
+  const assets = production.indexOf('      - id: assets')
+
+  assert.match(production, /uses: actions\/setup-node@[0-9a-f]{40}/)
+  assert.ok(setupNode >= 0)
+  assert.ok(install > setupNode)
+  assert.ok(assets > install)
+  assert.match(production.slice(install, assets), /- name: Install publication dependencies\n        run: npm ci/)
+})
+
 test('Production verifies prior stable, publishes once, and compensates only after publish success', () => {
   assert.match(production, /channels\/stable\.json/)
   assert.match(production, /keys \| sort.*manifest_sha256.*version|manifest_sha256.*version.*keys \| sort/)
