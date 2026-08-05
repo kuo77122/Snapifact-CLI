@@ -40,38 +40,48 @@ then undrafts that one release. It has no `always()` or bypass path. Any
 finalizer failure leaves the Release draft and requires a separately approved
 finalize-or-rollback decision.
 
-### Activation gates and recovery
+### Correction status and fresh release gates
 
-The candidate for this cutover is `v0.2.4`; the mutable rollback target is the
-currently healthy `v0.2.2`. The existing `v0.2.3` draft and history remain
-untouched. Gates are separate and ordered:
+The `v0.2.4` attempt failed closed in run `30975075137` during current-run
+provenance revalidation, before the credential-bearing step. The upload action
+exposed a raw SHA-256 hex digest while the REST artifact and downloaded archive
+checks use the canonical `sha256:<hex>` form. The publish output now adds that
+prefix exactly once at the job boundary; the Production consumer still requires
+literal equality with both the REST `.digest` and the downloaded ZIP checksum.
 
-1. Planner proves the merged activation SHA and green configured checks.
-2. The owner separately authorizes and creates/pushes `v0.2.4` at that exact
+`v0.2.4` is abandoned as a release candidate. Its tag and draft Release remain
+untouched, its provenance artifact remains an audit record, all six exact
+`v0.2.4` objects remain absent, and public exact/latest/stable remains healthy
+`v0.2.2`. Do not rerun, move, delete, replace, or clean up `v0.2.4`.
+
+The fresh candidate is `v0.3.0`, created only at the correction PR's future
+merge SHA. Its gates are separate and ordered:
+
+1. Planner proves the correction merge SHA and green configured checks.
+2. The owner separately authorizes and creates/pushes `v0.3.0` at that exact
    SHA. This workflow does not create tags.
-3. The tag run verifies the tag, builds the six assets, creates one draft
-   Release, revalidates the assets, and uploads one current-run provenance
-   artifact.
-4. Before Production approval, Planner rechecks the tag/run/artifact/SHA,
-   exact six digests, draft identity, and healthy unchanged `v0.2.2` stable
-   state.
+3. The new tag run creates its own draft Release, revalidates six assets, and
+   uploads its own current-run provenance artifact with the canonical prefixed
+   digest.
+4. Before Production approval, Planner rechecks the new tag/run/artifact/SHA,
+   exact six digests, draft identity, and healthy unchanged `v0.2.2` state.
 5. The owner separately approves the waiting `r2-release-production`
    deployment.
-6. The workflow verifies prior stable, publishes once, verifies the candidate,
+6. The workflow verifies prior stable, publishes `v0.3.0` once, verifies it,
    performs the existing credential-free installer and `go install` smoke, and
    compensates once only if publication succeeded and a later check fails.
-7. The finalizer undrafts the matching Release only after complete Production
-   success.
+7. The finalizer undrafts the matching `v0.3.0` Release only after complete
+   Production success.
 
 Repository rulesets and classic `main` protection are intentionally deferred at
 the current single-writer scale. Accepted compensating controls are one
 reviewed PR, current-head review, green `go` and `Verify (ubuntu-latest)`
 checks, exact tag/SHA/provenance gates, and the required Production reviewer.
 Paid immutable-tag and required-check enforcement becomes mandatory before a
-second writer or write-capable automation, before a second standalone
-Production release, or before FAT-485 retires Core rollback ownership.
+second writer or write-capable automation, or before another Production release
+after `v0.3.0`. Core rollback remains retained; FAT-485 does not retire it.
 
-Calling `publish` may write immutable exact `downloads/v0.2.4/*` objects before
+Calling `publish` may write immutable exact `downloads/v0.3.0/*` objects before
 returning. Rollback never deletes or overwrites exact history; it restores only
 mutable latest/stable to the verified `v0.2.2` state. These outcomes remain
 distinct and require no retry or delete behavior:
@@ -81,7 +91,7 @@ distinct and require no retry or delete behavior:
   `v0.2.2`: record irreversible residue, leave the draft, and require a
   separately approved replan before any same-version rerun or replacement;
 - partial or mismatched exact candidate objects: stop as an immutable-version
-  incident and never overwrite, delete, or reuse `v0.2.4` without a separate
+  incident and never overwrite, delete, or reuse `v0.3.0` without a separate
   recovery decision;
 - unproven prior `v0.2.2` latest/stable: stop and obtain separate owner
   approval for the FAT-512-aligned Core rollback path;
@@ -89,14 +99,15 @@ distinct and require no retry or delete behavior:
   compensation; failed compensation or finalization leaves the draft and
   requires a separately approved finalize-or-rollback decision.
 
-Stop on scope drift, changed head, missing or failed checks, a pre-existing
-`v0.2.4` tag/Release/object, unresolved gate timing, unexpected environment or
-credential names, tag/run/artifact/SHA/digest drift, partial or mismatched
-residue, public/signed divergence, latest/stable non-convergence, unavailable
-rollback, or any deployment requirement outside this workflow. Record only
-sanitized job, run, artifact, SHA, digest, command outcome, and convergence
-evidence; never record credentials, private values, raw bodies, signed
-material, URLs with credentials, or asset bytes.
+Stop on scope drift, changed head, missing or failed checks, mutation of the
+abandoned `v0.2.4` tag/draft/artifact, a pre-existing `v0.3.0` tag/Release/object,
+unresolved gate timing, unexpected environment or credential names,
+tag/run/artifact/SHA/digest drift, partial or mismatched residue, public/signed
+divergence, latest/stable non-convergence, unavailable rollback, or any
+deployment requirement outside this workflow. Record only sanitized job, run,
+artifact, SHA, digest, command outcome, and convergence evidence; never record
+credentials, private values, raw bodies, signed material, URLs with credentials,
+or asset bytes.
 
 ## Before dispatch
 
