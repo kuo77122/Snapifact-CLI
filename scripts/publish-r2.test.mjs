@@ -8,8 +8,9 @@ import { createHash } from 'node:crypto'
 import {
   BINARY_ASSETS,
   CACHE_CONTROL,
+  COMMANDS,
   CONTENT_TYPES,
-  formatStableDiagnostic,
+  createPublisherFromEnv,
   RELEASE_ASSETS,
   compareVersions,
   isAllowedKey,
@@ -71,97 +72,20 @@ test('publishes only fixed object names with fixed metadata', () => {
   assert.equal(isAllowedKey('channels/stable.json'), true)
 })
 
-function diagnosticPublisher({ status = 200, etag, body = 'diagnostic body must stay private' } = {}) {
-  const calls = []
-  const publisher = new R2Publisher({
-    s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
-    signedFetch: async (url, init) => {
-      calls.push({ method: init.method, key: new URL(url).pathname.replace('/bucket/', '') })
-      return new Response(body, {
-        status,
-        headers: etag === undefined ? undefined : { etag },
-      })
-    },
+test('exposes only the three supported commands', () => {
+  assert.deepEqual(COMMANDS, ['publish', 'verify', 'rollback'])
+  assert.deepEqual(parseArguments(['publish', '--version', 'v0.2.2', '--assets', 'dist']), {
+    command: 'publish', version: 'v0.2.2', assets: 'dist',
   })
-  return { calls, publisher }
-}
-
-test('diagnoses stable ETag shape with one fixed signed GET and sanitized output', async () => {
-  for (const fixture of [
-    { etag: '"strong-value"', shape: 'strong-quoted', length: 14, fingerprint: '74d204071e7a' },
-    { etag: 'W/"weak-value"', shape: 'weak-quoted', length: 14, fingerprint: 'd78186d6f5b1' },
-    { etag: 'bare-value', shape: 'bare', length: 10, fingerprint: 'a0e140eecd20' },
-    { etag: '"a", "b"', shape: 'list-valued', length: 8, fingerprint: 'c024f81b26bb' },
-    {
-      etag: 'malformed https://secret.example Authorization:Bearer-token',
-      shape: 'other',
-      length: 59,
-      fingerprint: '8c5fa57ab17a',
-    },
-  ]) {
-    const fake = diagnosticPublisher({ etag: fixture.etag })
-    const result = await fake.publisher.diagnoseStableETag()
-
-    assert.deepEqual(result, {
-      status: 'present',
-      present: true,
-      shape: fixture.shape,
-      length: fixture.length,
-      fingerprint: fixture.fingerprint,
-    })
-    assert.deepEqual(fake.calls, [{ method: 'GET', key: 'channels/stable.json' }])
-    const output = formatStableDiagnostic(result)
-    assert.deepEqual(Object.keys(JSON.parse(output)), ['status', 'present', 'shape', 'length', 'fingerprint'])
-    assert.doesNotMatch(output, /malformed|secret|Authorization|Bearer|https:|diagnostic body/)
-  }
 })
 
-test('diagnostic reports missing and request failures without exposing response data', async () => {
-  const missing = diagnosticPublisher({ status: 404, body: 'private missing response' })
-  assert.deepEqual(await missing.publisher.diagnoseStableETag(), {
-    status: 'missing', present: false, shape: 'other', length: 0, fingerprint: null,
-  })
-  assert.deepEqual(missing.calls, [{ method: 'GET', key: 'channels/stable.json' }])
-
-  const failed = diagnosticPublisher({ status: 503, body: 'private provider response' })
-  assert.deepEqual(await failed.publisher.diagnoseStableETag(), {
-    status: 'request-failed', present: false, shape: 'other', length: 0, fingerprint: null,
-  })
-  assert.deepEqual(failed.calls, [{ method: 'GET', key: 'channels/stable.json' }])
-
-  const output = formatStableDiagnostic(await failed.publisher.diagnoseStableETag())
-  assert.doesNotMatch(output, /private|provider|response|503/)
-})
-
-test('stable diagnostic command has no caller-controlled selector or mutation arguments', () => {
-  assert.deepEqual(parseArguments(['stable-diagnostic']), { command: 'stable-diagnostic' })
-  for (const argument of [
-    ['stable-diagnostic', '--key', 'other.json'],
-    ['stable-diagnostic', '--url', 'https://public.example'],
-    ['stable-diagnostic', '--version', 'v0.2.2'],
-    ['stable-diagnostic', '--assets', 'dist'],
-    ['stable-diagnostic', '--environment', 'production'],
-  ]) assert.throws(() => parseArguments(argument))
-})
-
-test('stable diagnostic CLI emits one sanitized record and no error text', async () => {
-  const fake = diagnosticPublisher({ etag: '"https://user:secret@example.invalid"' })
-  const output = []
-  const status = await run(['stable-diagnostic'], {
-    publisherFactory: () => fake.publisher,
-    writeOutput: (text) => output.push(text),
-  })
-
-  assert.equal(status, 0)
-  assert.deepEqual(JSON.parse(output.join('')), {
-    status: 'present',
-    present: true,
-    shape: 'strong-quoted',
-    length: 37,
-    fingerprint: '6bcca9be25c1',
-  })
-  assert.doesNotMatch(output.join(''), /https:|secret|example|user|error|ETag/i)
+test('constructs the signed publisher without public-origin configuration', () => {
+  assert.doesNotThrow(() => createPublisherFromEnv({
+    SNAPIFACT_R2_ACCESS_KEY_ID: 'key',
+    SNAPIFACT_R2_SECRET_ACCESS_KEY: 'secret',
+    SNAPIFACT_R2_ACCOUNT_ID: 'account',
+    SNAPIFACT_R2_BUCKET: 'bucket',
+  }))
 })
 
 test('validates the exact six-file release inventory before constructing a client', async () => {
@@ -201,10 +125,13 @@ async function createReleaseAssets(version) {
   return directory
 }
 
+async function publishDirectory(publisher, version, directory) {
+  return publisher.publish(version, await validateAssets(directory, version))
+}
+
 function fakeR2() {
   const objects = new Map()
   const signedCalls = []
-  const publicCalls = []
   let etagNumber = 0
   let stablePutHook = null
   let stableProofHook = null
@@ -226,7 +153,6 @@ function fakeR2() {
     const method = init?.method ?? 'GET'
     const key = keyFrom(url)
     if (signed) signedCalls.push({ method, key, headers: new Headers(init?.headers), body: init?.body })
-    else publicCalls.push({ method, key })
     const object = objects.get(key)
     if (method === 'PUT') {
       if (key === 'channels/stable.json' && stablePutHook) return stablePutHook({ key, init, object })
@@ -265,32 +191,20 @@ function fakeR2() {
   return {
     objects,
     signedCalls,
-    publicCalls,
     setStablePutHook(hook) { stablePutHook = hook },
     setStableProofHook(hook) { stableProofHook = hook },
     setPutFailure(key, status, { persist = false } = {}) { putFailures.set(key, { status, persist }) },
     publisher: new R2Publisher({
       s3Origin: 'https://account.example/bucket',
-      publicOrigin: 'https://public.example',
       signedFetch: (url, init) => request(url, init, true),
-      publicFetch: (url, init) => request(url, init, false),
     }),
   }
-}
-
-function publicPublisher(publicFetch) {
-  return new R2Publisher({
-    s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
-    signedFetch: async () => new Response(null, { status: 404 }),
-    publicFetch,
-  })
 }
 
 test('publishes exact objects, refreshes latest in order, and commits stable last', async () => {
   const directory = await createReleaseAssets('v0.2.2')
   const fake = fakeR2()
-  const result = await fake.publisher.publish('v0.2.2', directory)
+  const result = await publishDirectory(fake.publisher, 'v0.2.2', directory)
 
   assert.equal(result.version, 'v0.2.2')
   const puts = fake.signedCalls.filter(({ method }) => method === 'PUT')
@@ -318,7 +232,7 @@ test('proves a weak stable ETag before mutation and reuses its exact candidate',
     etag: 'W/"old-stable"',
   })
 
-  await fake.publisher.publish('v0.2.3', newDirectory)
+  await publishDirectory(fake.publisher, 'v0.2.3', newDirectory)
 
   const stableGets = fake.signedCalls.filter(({ method, key }) => method === 'GET' && key === 'channels/stable.json')
   const firstMutation = fake.signedCalls.findIndex(({ method }) => method === 'PUT')
@@ -361,7 +275,7 @@ test('stops before mutation when weak stable ETag proof fails', async () => {
     fake.setStableProofHook(proof)
 
     await assert.rejects(
-      fake.publisher.publish('v0.2.3', newDirectory),
+      publishDirectory(fake.publisher, 'v0.2.3', newDirectory),
       (error) => {
         assert.equal(error.code, 'invalid-precondition', name)
         assert.equal(error.diagnostics.proof, classification, name)
@@ -390,7 +304,7 @@ test('rejects unsupported stable ETag shapes before any publication mutation', a
       etag,
     })
 
-    await assert.rejects(fake.publisher.publish('v0.2.3', newDirectory), (error) => {
+    await assert.rejects(publishDirectory(fake.publisher, 'v0.2.3', newDirectory), (error) => {
       assert.ok(error.code === 'invalid-precondition' || error.code === 'invalid-stable')
       assert.doesNotMatch(sanitizeError(error), /bare-value|private/)
       return true
@@ -431,7 +345,7 @@ test('routes a post-proof weak stable 412 through compensation without retrying 
     return new Response(null, { status: 412 })
   })
 
-  await assert.rejects(fake.publisher.publish('v0.2.3', newDirectory), /stable index changed/)
+  await assert.rejects(publishDirectory(fake.publisher, 'v0.2.3', newDirectory), /stable index changed/)
   const stableCalls = fake.signedCalls.filter(({ key }) => key === 'channels/stable.json')
   assert.equal(stableCalls.filter(({ method, headers }) => method === 'GET' && headers.get('if-match') === '"old-stable"').length, 1)
   assert.equal(stableCalls.filter(({ method }) => method === 'PUT').length, 1)
@@ -439,14 +353,11 @@ test('routes a post-proof weak stable 412 through compensation without retrying 
   assert.deepEqual(fake.objects.get('channels/stable.json').bytes, stableBytes('v0.2.2', old.manifest_sha256))
 })
 
-test('publishes from signed GET state without requesting the public origin', async () => {
+test('publishes from signed GET state', async () => {
   const directory = await createReleaseAssets('v0.2.2')
   const fake = fakeR2()
-  fake.publisher.publicFetch = async () => {
-    throw new Error('public origin must not be requested during publication')
-  }
 
-  const result = await fake.publisher.publish('v0.2.2', directory)
+  const result = await publishDirectory(fake.publisher, 'v0.2.2', directory)
 
   assert.equal(result.version, 'v0.2.2')
   assert.ok(fake.signedCalls.some(({ method }) => method === 'GET'))
@@ -462,7 +373,7 @@ test('accepts a matching exact-object retry after a conditional conflict without
     etag: '"existing"',
   })
 
-  await fake.publisher.publish('v0.2.2', directory)
+  await publishDirectory(fake.publisher, 'v0.2.2', directory)
   const firstPut = fake.signedCalls.find(({ method, key }) => method === 'PUT' && key.endsWith('/snapifact_linux_amd64'))
   assert.equal(firstPut.headers.get('if-none-match'), '*')
   assert.deepEqual(fake.objects.get('downloads/v0.2.2/snapifact_linux_amd64').bytes, prepared.assets.snapifact_linux_amd64)
@@ -478,7 +389,7 @@ test('rejects a lower version before any write', async () => {
     etag: '"stable"',
   })
 
-  await assert.rejects(fake.publisher.publish('v0.2.1', directory), /older than stable/)
+  await assert.rejects(publishDirectory(fake.publisher, 'v0.2.1', directory), /older than stable/)
   assert.equal(fake.signedCalls.some(({ method }) => method === 'PUT'), false)
 })
 
@@ -507,7 +418,7 @@ test('compensates latest to the observed stable release after a stale stable con
   fake.setStablePutHook(() => new Response(null, { status: 412 }))
 
   await assert.rejects(
-    fake.publisher.publish('v0.2.3', newDirectory),
+    publishDirectory(fake.publisher, 'v0.2.3', newDirectory),
     (error) => {
       assert.match(error.message, /stable index changed/)
       assert.equal(error.diagnostics.classification, 'state-changed')
@@ -552,7 +463,7 @@ test('restores latest from trusted prior state when stable 412 readback is inval
   })
 
   await assert.rejects(
-    fake.publisher.publish('v0.2.3', newDirectory),
+    publishDirectory(fake.publisher, 'v0.2.3', newDirectory),
     (error) => {
       assert.match(error.message, /compensation did not converge/)
       assert.equal(error.diagnostics.classification, 'readback-unavailable')
@@ -579,17 +490,17 @@ test('accepts a stable 412 when a concurrent publisher committed the same canoni
     return new Response(null, { status: 412 })
   })
 
-  const result = await fake.publisher.publish('v0.2.3', directory)
+  const result = await publishDirectory(fake.publisher, 'v0.2.3', directory)
   assert.deepEqual(result, { version: 'v0.2.3', manifest_sha256: inventory.manifest_sha256 })
 })
 
 test('preserves the opaque quoted ETag for same-version conditional promotion', async () => {
   const directory = await createReleaseAssets('v0.2.2')
   const fake = fakeR2()
-  await fake.publisher.publish('v0.2.2', directory)
+  await publishDirectory(fake.publisher, 'v0.2.2', directory)
   fake.signedCalls.length = 0
 
-  await fake.publisher.publish('v0.2.2', directory)
+  await publishDirectory(fake.publisher, 'v0.2.2', directory)
   const stablePut = fake.signedCalls.find(({ method, key }) => method === 'PUT' && key === 'channels/stable.json')
   assert.match(stablePut.headers.get('if-match'), /^"fake-/)
 })
@@ -598,7 +509,6 @@ test('rejects malformed stable ETags before sending a conditional write', async 
   let signedPuts = 0
   const publisher = new R2Publisher({
     s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
     signedFetch: async (_url, init) => {
       if (init.method === 'PUT') signedPuts += 1
       return new Response(null, { status: 200 })
@@ -624,25 +534,18 @@ test('resolves a conditional exact-write 5xx by matching signed metadata and byt
   const fake = fakeR2()
   fake.setPutFailure('downloads/v0.2.2/snapifact_linux_amd64', 503, { persist: true })
 
-  await fake.publisher.publish('v0.2.2', directory)
+  await publishDirectory(fake.publisher, 'v0.2.2', directory)
   const writes = fake.signedCalls.filter(({ method, key }) => method === 'PUT' && key === 'downloads/v0.2.2/snapifact_linux_amd64')
   assert.equal(writes.length, 1)
-  assert.equal(fake.publicCalls.length, 0)
 })
 
 test('fails mutable write ambiguity closed when signed read-back is missing', async () => {
   let signedCalls = 0
-  let publicCalls = 0
   const publisher = new R2Publisher({
     s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
     signedFetch: async (_url, init) => {
       signedCalls += 1
       if (init.method === 'PUT') throw new Error('transport')
-      return new Response(null, { status: 404 })
-    },
-    publicFetch: async () => {
-      publicCalls += 1
       return new Response(null, { status: 404 })
     },
   })
@@ -652,22 +555,15 @@ test('fails mutable write ambiguity closed when signed read-back is missing', as
     /mutable object write outcome is unknown/,
   )
   assert.equal(signedCalls, 2)
-  assert.equal(publicCalls, 0)
 })
 
 test('fails mutable ambiguity closed on signed authorization failure', async () => {
   let signedCalls = 0
-  let publicCalls = 0
   const publisher = new R2Publisher({
     s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
     signedFetch: async (_url, init) => {
       signedCalls += 1
       if (init.method === 'PUT') throw new Error('transport')
-      return new Response(null, { status: 403 })
-    },
-    publicFetch: async () => {
-      publicCalls += 1
       return new Response(null, { status: 403 })
     },
   })
@@ -677,7 +573,6 @@ test('fails mutable ambiguity closed on signed authorization failure', async () 
     /signed GET request failed/,
   )
   assert.equal(signedCalls, 2)
-  assert.equal(publicCalls, 0)
 })
 
 test('resolves an exact conditional 412 from one matching signed GET', async () => {
@@ -687,7 +582,6 @@ test('resolves an exact conditional 412 from one matching signed GET', async () 
   const signedMethods = []
   const publisher = new R2Publisher({
     s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
     signedFetch: async (_url, init) => {
       signedMethods.push(init.method)
       if (init.method === 'PUT') {
@@ -696,7 +590,6 @@ test('resolves an exact conditional 412 from one matching signed GET', async () 
       }
       return new Response(bytes, { status: 200, headers: { ...metadata, etag: '"existing"' } })
     },
-    publicFetch: async () => { throw new Error('public origin must not be requested') },
   })
 
   const result = await publisher.putExact('downloads/v0.2.2/install.sh', bytes, 'install.sh')
@@ -713,7 +606,6 @@ test('fails mutable ambiguity closed on a signed read-back 5xx', async () => {
   let signedGets = 0
   const publisher = new R2Publisher({
     s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
     signedFetch: async (_url, init) => {
       if (init.method === 'PUT') {
         signedPuts += 1
@@ -722,7 +614,6 @@ test('fails mutable ambiguity closed on a signed read-back 5xx', async () => {
       signedGets += 1
       return new Response(null, { status: 503 })
     },
-    publicFetch: async () => { throw new Error('public origin must not be requested') },
   })
 
   await assert.rejects(publisher.putLatest('install.sh', bytes), /signed GET request failed/)
@@ -734,9 +625,6 @@ test('compensates a partial latest failure to the previous stable release', asyn
   const oldDirectory = await createReleaseAssets('v0.2.2')
   const newDirectory = await createReleaseAssets('v0.2.3')
   const fake = fakeR2()
-  fake.publisher.publicFetch = async () => {
-    throw new Error('public origin must not be requested during compensation')
-  }
   const old = await validateAssets(oldDirectory, 'v0.2.2')
   for (const asset of RELEASE_ASSETS) {
     fake.objects.set(`downloads/v0.2.2/${asset}`, {
@@ -757,7 +645,7 @@ test('compensates a partial latest failure to the previous stable release', asyn
   })
   fake.setPutFailure('downloads/latest/install.sh', 503)
 
-  await assert.rejects(fake.publisher.publish('v0.2.3', newDirectory), /signed object bytes do not match/)
+  await assert.rejects(publishDirectory(fake.publisher, 'v0.2.3', newDirectory), /signed object bytes do not match/)
   for (const asset of RELEASE_ASSETS) {
     assert.deepEqual(fake.objects.get(`downloads/latest/${asset}`).bytes, old.assets[asset])
   }
@@ -769,9 +657,6 @@ test('rollback promotes an already verified immutable release without replacing 
   const fake = fakeR2()
   const old = await validateAssets(oldDirectory, 'v0.2.2')
   const current = await validateAssets(currentDirectory, 'v0.2.3')
-  fake.publisher.publicFetch = async () => {
-    throw new Error('public origin must not be requested during rollback')
-  }
   for (const [version, inventory] of [['v0.2.2', old], ['v0.2.3', current]]) {
     for (const asset of RELEASE_ASSETS) {
       fake.objects.set(`downloads/${version}/${asset}`, {
@@ -790,7 +675,6 @@ test('rollback promotes an already verified immutable release without replacing 
   await fake.publisher.rollback('v0.2.2')
   assert.deepEqual(fake.objects.get('channels/stable.json').bytes, stableBytes('v0.2.2', old.manifest_sha256))
   assert.deepEqual(fake.objects.get('downloads/v0.2.3/install.sh').bytes, current.assets['install.sh'])
-  assert.equal(fake.publicCalls.length, 0)
 })
 
 test('rollback shares stable 412 compensation for a different trusted target', async () => {
@@ -854,21 +738,17 @@ test('signed immutable read-back fails closed on metadata, byte, and missing-obj
           ? /immutable release checksum mismatch/
           : /immutable release object is missing/,
     )
-    assert.equal(fake.publicCalls.length, 0)
   }
 })
 
-test('explicit verify continues to check public exact, latest, and stable delivery', async () => {
+test('explicit verify checks signed exact, latest, and stable state', async () => {
   const directory = await createReleaseAssets('v0.2.2')
   const fake = fakeR2()
-  await fake.publisher.publish('v0.2.2', directory)
-  fake.publicCalls.length = 0
+  await publishDirectory(fake.publisher, 'v0.2.2', directory)
 
   await fake.publisher.verify('v0.2.2')
 
-  assert.equal(fake.publicCalls.length, RELEASE_ASSETS.length * 2 + 1)
-  assert.deepEqual(new Set(fake.publicCalls.map(({ method }) => method)), new Set(['GET']))
-  assert.ok(fake.publicCalls.some(({ key }) => key === 'channels/stable.json'))
+  assert.ok(fake.signedCalls.some(({ method, key }) => method === 'GET' && key === 'channels/stable.json'))
 })
 
 test('rejects an anonymously verified installer whose assignment is not pinned', async () => {
@@ -890,189 +770,7 @@ test('rejects an anonymously verified installer whose assignment is not pinned',
     })
   }
 
-  await assert.rejects(fake.publisher.verifyPublicRelease('v0.2.2'), /installer pin does not match/)
-})
-
-test('treats a public stable GET 404 as missing state without a public HEAD', async () => {
-  const methods = []
-  const publisher = new R2Publisher({
-    s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
-    signedFetch: async () => new Response(null, { status: 404 }),
-    publicFetch: async (_url, init) => {
-      methods.push(init.method)
-      return new Response(null, { status: 404 })
-    },
-  })
-
-  assert.equal(await publisher.readStablePublic(), null)
-  assert.deepEqual(methods, ['GET'])
-})
-
-test('recovers expected public stable reads from transient statuses and 404 visibility', async () => {
-  const stable = stableBytes('v0.2.2', 'a'.repeat(64))
-  const responses = [
-    new Response(null, { status: 503 }),
-    new Response(null, { status: 404 }),
-    new Response(stable, {
-      status: 200,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': CACHE_CONTROL.mutable },
-    }),
-  ]
-  let calls = 0
-  const methods = []
-  const publisher = new R2Publisher({
-    s3Origin: 'https://account.example/bucket',
-    publicOrigin: 'https://public.example',
-    signedFetch: async () => new Response(null, { status: 404 }),
-    publicFetch: async (_url, init) => {
-      methods.push(init.method)
-      return responses[calls++]
-    },
-  })
-
-  const result = await publisher.readStablePublic({ expected: true })
-
-  assert.equal(result.version, 'v0.2.2')
-  assert.equal(calls, responses.length)
-  assert.deepEqual(methods, ['GET', 'GET', 'GET'])
-})
-
-test('retries every approved transient public status', async () => {
-  for (const status of [408, 425, 429, 500]) {
-    let calls = 0
-    const publisher = publicPublisher(async () => {
-      calls += 1
-      return new Response(null, { status: calls === 1 ? status : 200 })
-    })
-
-    const response = await publisher.publicRequest('GET', 'downloads/v0.2.2/install.sh', { retry: true, retry404: true })
-
-    assert.equal(response.status, 200)
-    assert.equal(calls, 2)
-  }
-})
-
-test('recovers expected exact and latest objects after 404 visibility', async () => {
-  for (const [key, metadata] of [
-    ['downloads/v0.2.2/install.sh', objectMetadata('install.sh')],
-    ['downloads/latest/install.sh', objectMetadata('install.sh', { immutable: false })],
-  ]) {
-    const expected = new TextEncoder().encode(`${key}\n`)
-    let calls = 0
-    const methods = []
-    const publisher = publicPublisher(async (_url, init) => {
-      calls += 1
-      methods.push(init.method)
-      if (calls === 1) return new Response(null, { status: 404 })
-      return new Response(expected, { status: 200, headers: metadata })
-    })
-
-    const result = await publisher.publicObject(key, expected, metadata, { retry: true, retry404: true })
-
-    assert.deepEqual(result.bytes, expected)
-    assert.equal(calls, 2)
-    assert.deepEqual(methods, ['GET', 'GET'])
-  }
-})
-
-test('recovers an expected public read after a request timeout', async () => {
-  const stable = stableBytes('v0.2.2', 'a'.repeat(64))
-  let calls = 0
-  const methods = []
-  const publisher = publicPublisher(async (_url, init) => {
-    calls += 1
-    methods.push(init.method)
-    if (calls === 1) {
-      return new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))))
-    }
-    return new Response(stable, {
-      status: 200,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': CACHE_CONTROL.mutable },
-    })
-  })
-
-  const result = await publisher.readStablePublic({ expected: true })
-
-  assert.equal(result.version, 'v0.2.2')
-  assert.equal(calls, 2)
-  assert.deepEqual(methods, ['GET', 'GET'])
-})
-
-test('fails permanent public authorization errors without retrying', async () => {
-  for (const status of [401, 403]) {
-    let calls = 0
-    const methods = []
-    const publisher = publicPublisher(async (_url, init) => {
-      calls += 1
-      methods.push(init.method)
-      return new Response(null, { status })
-    })
-
-    await assert.rejects(
-      publisher.readStablePublic({ expected: true }),
-      (error) => {
-        assert.match(error.message, new RegExp(`status ${status}, attempt 1`))
-        assert.doesNotMatch(error.message, /public\.example|content-type|signature/i)
-        return true
-      },
-    )
-    assert.equal(calls, 1)
-    assert.deepEqual(methods, ['GET'])
-  }
-})
-
-test('bounds public retry exhaustion to three attempts with sanitized context', async () => {
-  let calls = 0
-  const publisher = publicPublisher(async () => {
-    calls += 1
-    return new Response(null, { status: 503 })
-  })
-
-  await assert.rejects(
-    publisher.readStablePublic({ expected: true }),
-    (error) => {
-      assert.match(error.message, /status 503, attempt 3/)
-      assert.doesNotMatch(error.message, /public\.example|content-type|signature/i)
-      return true
-    },
-  )
-  assert.equal(calls, 3)
-})
-
-test('does not retry public metadata or byte mismatches', async () => {
-  let metadataCalls = 0
-  const metadataMethods = []
-  const metadataPublisher = publicPublisher(async (_url, init) => {
-    metadataCalls += 1
-    metadataMethods.push(init.method)
-    return new Response(null, {
-      status: 200,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'public, max-age=1' },
-    })
-  })
-  await assert.rejects(metadataPublisher.readStablePublic({ expected: true }), /metadata does not match/)
-  assert.equal(metadataCalls, 1)
-  assert.deepEqual(metadataMethods, ['GET'])
-
-  let byteCalls = 0
-  const byteMethods = []
-  const bytePublisher = publicPublisher(async (_url, init) => {
-    byteCalls += 1
-    byteMethods.push(init.method)
-    return new Response(new Uint8Array([2]), { status: 200, headers: { ...objectMetadata('snapifact_linux_amd64') } })
-  })
-  await assert.rejects(
-    bytePublisher.publicObject(
-      'downloads/v0.2.2/snapifact_linux_amd64',
-      new Uint8Array([1]),
-      objectMetadata('snapifact_linux_amd64'),
-      { retry: true, retry404: true },
-    ),
-    /public object bytes do not match/,
-  )
-  assert.equal(byteCalls, 1)
-  assert.deepEqual(byteMethods, ['GET'])
+  await assert.rejects(fake.publisher.verifySignedRelease('v0.2.2'), /installer pin does not match/)
 })
 
 test('local publish validation fails before a publisher or credential lookup', async () => {
@@ -1088,6 +786,53 @@ test('local publish validation fails before a publisher or credential lookup', a
   })
   assert.equal(status, 1)
   assert.equal(factoryCalled, false)
+})
+
+test('passes the one validated inventory into publication after factory construction', async () => {
+  const directory = await createReleaseAssets('v0.2.2')
+  let received
+  const status = await run([
+    'publish', '--version', 'v0.2.2', '--assets', directory,
+  ], {
+    publisherFactory: () => ({
+      publish: async (_version, inventory) => { received = inventory },
+    }),
+  })
+
+  assert.equal(status, 0)
+  assert.equal(received.version, 'v0.2.2')
+  assert.equal(received.assets['install.sh'] instanceof Uint8Array, true)
+})
+
+test('direct publication rejects an inventory that was not validated by the helper', async () => {
+  const fake = fakeR2()
+  await assert.rejects(
+    fake.publisher.publish('v0.2.2', { version: 'v0.2.2', assets: {} }),
+    /validated release inventory/,
+  )
+  assert.equal(fake.signedCalls.length, 0)
+})
+
+test('rejects a coherently mutated validated inventory before any signed request', async () => {
+  const directory = await createReleaseAssets('v0.2.2')
+  const inventory = await validateAssets(directory, 'v0.2.2')
+  const mutatedInstaller = new Uint8Array(inventory.assets['install.sh'])
+  mutatedInstaller[0] ^= 1
+  inventory.assets['install.sh'] = mutatedInstaller
+  inventory.manifest.set('install.sh', manifestDigest(mutatedInstaller))
+  const manifest = `${RELEASE_ASSETS
+    .filter((asset) => asset !== 'SHA256SUMS')
+    .map((asset) => `${inventory.manifest.get(asset)}  ${asset}`)
+    .join('\n')}\n`
+  inventory.assets.SHA256SUMS = new TextEncoder().encode(manifest)
+  inventory.manifest_sha256 = manifestDigest(inventory.assets.SHA256SUMS)
+
+  const fake = fakeR2()
+  await assert.rejects(
+    fake.publisher.publish('v0.2.2', inventory),
+    /validated release inventory changed/,
+  )
+  assert.equal(fake.signedCalls.length, 0)
 })
 
 test('release workflow keeps draft creation tag-push-only and preview owner-gated', async () => {

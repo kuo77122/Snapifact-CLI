@@ -21,7 +21,6 @@ const publish = jobBlock('publish')
 const preflight = jobBlock('preflight')
 const preview = jobBlock('preview-r2-rehearsal')
 const backfill = jobBlock('backfill-v023')
-const diagnostic = jobBlock('stable-diagnostic')
 const production = jobBlock('publish-production')
 const finalizer = jobBlock('finalize-production-release')
 const assets = [
@@ -45,47 +44,6 @@ test('manual preview is owner-only, main-only, and checks out dispatch HEAD', ()
   )
   assert.match(preflight, /ref: \$\{\{ github\.sha \}\}/)
   assert.match(preview, /ref: \$\{\{ github\.sha \}\}/)
-})
-
-test('stable diagnostic is an owner/main-only operation with exact source binding', () => {
-  assert.match(workflow, /- stable-diagnostic/)
-  assert.match(
-    diagnostic,
-    /if: \$\{\{ github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main' && github\.actor == github\.repository_owner && inputs\.operation == 'stable-diagnostic' && needs\.verify\.result == 'success' \}\}/,
-  )
-  assert.match(diagnostic, /^    needs: verify$/m)
-  assert.match(diagnostic, /ref: \$\{\{ github\.sha \}\}/)
-  assert.match(diagnostic, /GITHUB_REPOSITORY.*kuo77122\/Snapifact-CLI/)
-  assert.match(diagnostic, /GITHUB_SHA.*\^\[0-9a-f\]\{40\}\$/)
-  assert.match(diagnostic, /git fetch --no-tags origin refs\/heads\/main:refs\/remotes\/origin\/main/)
-  assert.match(diagnostic, /git ls-remote origin refs\/heads\/main/)
-  assert.match(diagnostic, /refs\/remotes\/origin\/main/)
-  assert.match(diagnostic, /git merge-base --is-ancestor/)
-  assert.doesNotMatch(diagnostic, /inputs\.(?:version|key|url|assets|environment|bucket|public_origin)/)
-})
-
-test('stable diagnostic binds only the five existing Preview values on its final step', () => {
-  assert.match(diagnostic, /^    environment: r2-release-preview$/m)
-  assert.match(diagnostic, /concurrency:\n      group: snapifact-r2-preview-publication\n      cancel-in-progress: false/)
-  assert.match(diagnostic, /permissions:\n      contents: read/)
-  assert.doesNotMatch(diagnostic, /contents: write|actions: write|upload-artifact|gh release|publish-r2\.mjs (publish|verify|rollback)|\b(?:PUT|POST|PATCH|DELETE|LIST)\b/i)
-
-  const credentialStart = diagnostic.indexOf('      - name: Read stable validator diagnostic')
-  assert.ok(credentialStart >= 0)
-  const credentialStep = diagnostic.slice(credentialStart)
-  assert.doesNotMatch(diagnostic.slice(0, credentialStart), /SNAPIFACT_R2_/)
-  for (const reference of [
-    'secrets.SNAPIFACT_R2_ACCESS_KEY_ID',
-    'secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY',
-    'vars.SNAPIFACT_R2_ACCOUNT_ID',
-    'vars.SNAPIFACT_R2_BUCKET',
-    'vars.SNAPIFACT_R2_PUBLIC_ORIGIN',
-  ]) {
-    assert.equal((diagnostic.match(new RegExp(reference.replaceAll('.', '\\.'), 'g')) ?? []).length, 1, reference)
-    assert.match(credentialStep, new RegExp(reference.replaceAll('.', '\\.')))
-  }
-  assert.deepEqual([...credentialStep.matchAll(/node scripts\/publish-r2\.mjs stable-diagnostic/g)].map(() => 'stable-diagnostic'), ['stable-diagnostic'])
-  assert.doesNotMatch(credentialStep, /--(?:key|url|version|assets|environment)/)
 })
 
 test('dispatch version selects release assets and helper arguments, never implementation code', () => {
@@ -130,7 +88,7 @@ test('mutation re-downloads into a fresh directory and requires independent prov
 })
 
 test('only the final credential-bearing step binds approved Preview values', () => {
-  const credentialStart = preview.indexOf('      - name: Publish, verify, matching retry, rollback, and final verify')
+  const credentialStart = preview.indexOf('      - name: Publish, verify, rollback, and final verify')
   assert.ok(credentialStart >= 0)
   const beforeCredentials = preview.slice(0, credentialStart)
   const credentialStep = preview.slice(credentialStart)
@@ -139,7 +97,6 @@ test('only the final credential-bearing step binds approved Preview values', () 
     'secrets.SNAPIFACT_R2_SECRET_ACCESS_KEY',
     'vars.SNAPIFACT_R2_ACCOUNT_ID',
     'vars.SNAPIFACT_R2_BUCKET',
-    'vars.SNAPIFACT_R2_PUBLIC_ORIGIN',
   ]) {
     assert.equal((preview.match(new RegExp(reference.replaceAll('.', '\\.'), 'g')) ?? []).length, 1, reference)
     assert.doesNotMatch(beforeCredentials, new RegExp(reference.replaceAll('.', '\\.')))
@@ -147,16 +104,16 @@ test('only the final credential-bearing step binds approved Preview values', () 
   }
   assert.deepEqual(
     [...credentialStep.matchAll(/node scripts\/publish-r2\.mjs (publish|verify|rollback)/g)].map((match) => match[1]),
-    ['publish', 'verify', 'publish', 'verify', 'rollback', 'verify'],
+    ['publish', 'verify', 'rollback', 'verify'],
   )
-  assert.equal((credentialStep.match(/--assets "\$RELEASE_ASSETS_DIR"/g) ?? []).length, 2)
+  assert.equal((credentialStep.match(/--assets "\$RELEASE_ASSETS_DIR"/g) ?? []).length, 1)
 })
 
 test('ordinary verification and manual dispatch cannot create releases or resolve R2 credentials', () => {
   assert.match(publish, /if: \$\{\{ github\.event_name == 'push'/)
   assert.doesNotMatch(publish, /workflow_dispatch/)
   assert.doesNotMatch(verify, /SNAPIFACT_R2_|publish-r2\.mjs/)
-  const nonProductionJobs = `${verify}\n${publish}\n${preflight}\n${backfill}\n${diagnostic}`
+  const nonProductionJobs = `${verify}\n${publish}\n${preflight}\n${backfill}`
   assert.doesNotMatch(nonProductionJobs, /r2-release-production|production/i)
   assert.doesNotMatch(workflow, /inputs\.(?:environment|bucket|public_origin)/)
   assert.doesNotMatch(nonProductionJobs, /gh release (edit|delete)|\b(delete|list)\b/i)
@@ -208,42 +165,40 @@ test('Production installs publication dependencies before provenance revalidatio
   assert.match(production.slice(install, assets), /- name: Install publication dependencies\n        run: npm ci/)
 })
 
-test('Production verifies prior stable, publishes once, and compensates only after publish success', () => {
-  assert.match(production, /channels\/stable\.json/)
-  assert.match(production, /keys \| sort.*manifest_sha256.*version|manifest_sha256.*version.*keys \| sort/)
-  assert.match(production, /node scripts\/publish-r2\.mjs verify --version "\$PRIOR_VERSION"/)
+test('Production publishes once through the signed-authoritative helper', () => {
   assert.match(production, /node scripts\/publish-r2\.mjs publish --version "\$RELEASE_VERSION" --assets "\$RELEASE_ASSETS_DIR"/)
-  assert.match(production, /mutation_succeeded=true/)
   assert.deepEqual(
     [...production.matchAll(/node scripts\/publish-r2\.mjs (publish|verify|rollback)/g)].map((match) => match[1]),
-    ['verify', 'publish', 'verify', 'rollback', 'verify'],
+    ['publish'],
   )
-  assert.match(production, /if: \$\{\{ failure\(\) && steps\.publish_candidate\.outputs\.mutation_succeeded == 'true' \}\}/)
-  assert.doesNotMatch(production, /publish --version "\$RELEASE_VERSION"[^\n]*\n[^\n]*publish --version "\$RELEASE_VERSION"/)
+  assert.doesNotMatch(production, /channels\/stable\.json|SNAPIFACT_R2_PUBLIC_ORIGIN|mutation_succeeded|Compensate/)
 })
 
-test('Production public smoke is credential-free and finalization is success-gated and revalidated', () => {
+test('Production installer smoke is credential-free and non-blocking', () => {
   const smokeStart = production.indexOf('      - name: Canonical installer smoke')
   assert.ok(smokeStart >= 0)
-  const compensationStart = production.indexOf('      - name: Compensate to previously verified stable release')
-  assert.ok(compensationStart > smokeStart)
-  const smoke = production.slice(smokeStart, compensationStart)
+  const smoke = production.slice(smokeStart)
   assert.match(smoke, /https:\/\/snapifact\.dev\/downloads\/\$RELEASE_VERSION\/install\.sh/)
   assert.match(smoke, /SNAPIFACT_INSTALL_DIR/)
   assert.match(smoke, /--version/)
-  assert.match(smoke, /go install .*snapifact@.*RELEASE_VERSION/)
-  assert.doesNotMatch(smoke, /SNAPIFACT_R2_|r2-release-production/)
+  assert.match(smoke, /continue-on-error: true/)
+  assert.doesNotMatch(smoke, /SNAPIFACT_R2_|r2-release-production|go install|Compensate/)
+})
 
+test('removed public binding, diagnostic, and workflow compensation stay absent', () => {
+  assert.doesNotMatch(workflow, /SNAPIFACT_R2_PUBLIC_ORIGIN|diagnostic|Compensate to previously verified stable release|mutation_succeeded/)
+})
+
+test('Production finalization is success-gated, contents-write-only, and identity-only', () => {
   assert.match(finalizer, /^    needs: \[publish-production, publish\]$/m)
   assert.match(finalizer, /if: \$\{\{ needs\.publish-production\.result == 'success' \}\}/)
   assert.match(finalizer, /permissions:\n      contents: write/)
   assert.doesNotMatch(finalizer, /actions: write|always\(\)|SNAPIFACT_R2_|r2-release-production/)
   assert.match(finalizer, /\.draft == true/)
   assert.doesNotMatch(finalizer, /\.isDraft/)
-  assert.match(finalizer, /gh release download/)
   assert.match(finalizer, /tag.*GITHUB_SHA|GITHUB_SHA.*tag/)
-  assert.match(finalizer, /for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install\.sh/)
-  assert.match(finalizer, /EXPECTED_DIGEST_SET.*needs\.publish\.outputs\.digest_set/)
+  for (const asset of assets) assert.match(finalizer, new RegExp(`"${asset}"`))
+  assert.doesNotMatch(finalizer, /gh release download|sha256sum|validate-release|EXPECTED_DIGEST_SET|RELEASE_ASSETS_DIR/)
   assert.match(finalizer, /gh release edit "\$RELEASE_VERSION".*--draft=false/)
 })
 
