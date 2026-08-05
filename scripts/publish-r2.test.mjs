@@ -835,6 +835,24 @@ test('rejects a coherently mutated validated inventory before any signed request
   assert.equal(fake.signedCalls.length, 0)
 })
 
+test('rejects validated inventory asset-map key mutations before any signed request', async () => {
+  for (const mutation of ['added', 'replaced', 'removed']) {
+    const directory = await createReleaseAssets('v0.2.2')
+    const inventory = await validateAssets(directory, 'v0.2.2')
+    if (mutation === 'added') inventory.assets.extra = new Uint8Array([1])
+    if (mutation === 'replaced') inventory.assets = { ...inventory.assets, extra: new Uint8Array([1]) }
+    if (mutation === 'removed') delete inventory.assets['install.sh']
+
+    const fake = fakeR2()
+    await assert.rejects(
+      fake.publisher.publish('v0.2.2', inventory),
+      /validated release inventory changed/,
+      mutation,
+    )
+    assert.equal(fake.signedCalls.length, 0, mutation)
+  }
+})
+
 test('release workflow keeps draft creation tag-push-only and preview owner-gated', async () => {
   const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8')
   assert.match(workflow, /workflow_dispatch:/)
