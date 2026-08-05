@@ -840,7 +840,11 @@ test('rejects validated inventory asset-map key mutations before any signed requ
     const directory = await createReleaseAssets('v0.2.2')
     const inventory = await validateAssets(directory, 'v0.2.2')
     if (mutation === 'added') inventory.assets.extra = new Uint8Array([1])
-    if (mutation === 'replaced') inventory.assets = { ...inventory.assets, extra: new Uint8Array([1]) }
+    if (mutation === 'replaced') {
+      const replacement = { ...inventory.assets, extra: new Uint8Array([1]) }
+      delete replacement['install.sh']
+      inventory.assets = replacement
+    }
     if (mutation === 'removed') delete inventory.assets['install.sh']
 
     const fake = fakeR2()
