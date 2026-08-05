@@ -40,8 +40,28 @@ visibility without corrupting signed state. Make it blocking only if measured
 user-facing propagation failures become common or a release SLO is adopted.
 
 Finalization runs only after Production success, has `contents: write` only,
-and checks the exact versioned draft, canonical tag binding, and six asset names
-before undrafting. It does not download or hash the assets a second time.
+and receives the numeric Release ID selected by the publication job. The
+finalizer GETs that same ID, checks the numeric ID, draft state, canonical tag
+binding, and exact six asset names, then PATCHes that same ID with `draft=false`.
+It does not use tag-based Release lookup or tag-based CLI editing, and does not
+download or hash the assets a second time.
+
+### v0.3.2 finalization recovery
+
+Attempt 2 of run `31009358275` successfully published the signed Production
+exact/latest/stable state and passed the canonical installer smoke. Finalization
+then failed because authenticated `GET /repos/$GITHUB_REPOSITORY/releases/tags/v0.3.2`
+returned 404 for draft Release `365540523`; this was a Release lookup failure,
+not a signed publication failure. The owner revalidated the numeric Release ID,
+tag `v0.3.2`, unchanged tag SHA
+`f5f627bbf450770299b702749583a19b4aea8de2`, draft state, and six assets, then
+manually published only Release `365540523` with a numeric REST PATCH.
+
+Do not rerun the workflow, mutate R2, move the tag, create a new version, or
+edit the finalized Release as recovery. Future finalization selects exactly one
+matching draft from the authenticated Release list immediately after creation,
+passes its numeric ID between jobs, revalidates that ID before publication, and
+PATCHes only that numeric Release endpoint.
 
 ## Preview rehearsal
 

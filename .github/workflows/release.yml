@@ -67,6 +67,7 @@ jobs:
       artifact_digest: sha256:${{ steps.provenance_artifact.outputs.artifact-digest }}
       artifact_name: release-provenance-${{ github.ref_name }}
       digest_set: ${{ steps.draft_assets.outputs.digest_set }}
+      release_id: ${{ steps.release_identity.outputs.release_id }}
     permissions:
       contents: write
       actions: write
@@ -102,6 +103,18 @@ jobs:
           dist/snapifact_linux_amd64 dist/snapifact_linux_arm64
           dist/snapifact_darwin_amd64 dist/snapifact_darwin_arm64
           dist/SHA256SUMS dist/install.sh
+      - id: release_identity
+        name: Select one numeric draft release ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_pages=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          matching=$(jq -s --arg version "$GITHUB_REF_NAME" '[.[].[] | select(.draft == true and .tag_name == $version)]' <<<"$release_pages")
+          [[ "$(jq 'length' <<<"$matching")" -eq 1 ]]
+          release_id=$(jq -r '.[0].id' <<<"$matching")
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
       - id: draft_assets
         name: Download and revalidate exact draft assets
         env:
@@ -235,6 +248,7 @@ jobs:
       contents: write
     env:
       RELEASE_VERSION: ${{ github.ref_name }}
+      RELEASE_ID: ${{ needs.publish.outputs.release_id }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -256,9 +270,10 @@ jobs:
             tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')
           fi
           test "$tag_sha" = "$GITHUB_SHA"
-          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION")
-          jq -e --arg version "$RELEASE_VERSION" '(.draft == true) and (.tag_name == $version) and ([.assets[].name] | sort) == ["SHA256SUMS", "install.sh", "snapifact_darwin_amd64", "snapifact_darwin_arm64", "snapifact_linux_amd64", "snapifact_linux_arm64"]' <<<"$release" >/dev/null
-          gh release edit "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg release_id "$RELEASE_ID" --arg version "$RELEASE_VERSION" '(.id | type == "number") and ((.id | tostring) == $release_id) and (.draft == true) and (.tag_name == $version) and ([.assets[].name] | sort) == ["SHA256SUMS", "install.sh", "snapifact_darwin_amd64", "snapifact_darwin_arm64", "snapifact_linux_amd64", "snapifact_linux_arm64"]' <<<"$release" >/dev/null
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false >/dev/null
 
   backfill-v023:
     name: Backfill v0.2.3 provenance artifact
