@@ -16,12 +16,7 @@ const CHECKSUM_ASSETS = Object.freeze([...BINARY_ASSETS, 'install.sh'])
 const VERSION_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const HEX_PATTERN = /^[0-9a-f]{64}$/
 const ETAG_PATTERN = /^"(?:[^"\\\r\n]|\\.)+"$/
-const DIAGNOSTIC_QUOTED_ETAG_PATTERN = /^"(?:[^"\\\r\n]|\\.)*"$/
-const DIAGNOSTIC_WEAK_ETAG_PATTERN = /^W\/"(?:[^"\\\r\n]|\\.)*"$/
-const DIAGNOSTIC_BARE_ETAG_PATTERN = /^[^\s",]+$/
-const PUBLIC_MAX_ATTEMPTS = 3
-const PUBLIC_REQUEST_TIMEOUT_MS = 2000
-const PUBLIC_RETRY_DELAY_MS = 100
+const validatedInventories = new WeakSet()
 
 export const CONTENT_TYPES = Object.freeze({
   snapifact_linux_amd64: 'application/octet-stream',
@@ -38,7 +33,7 @@ export const CACHE_CONTROL = Object.freeze({
 })
 
 export const STABLE_CONTENT_TYPE = 'application/json; charset=utf-8'
-export const COMMANDS = Object.freeze(['publish', 'verify', 'rollback', 'stable-diagnostic'])
+export const COMMANDS = Object.freeze(['publish', 'verify', 'rollback'])
 
 export class PublicationError extends Error {
   constructor(code, message, { retryable = false, status = undefined, diagnostics = undefined } = {}) {
@@ -152,54 +147,6 @@ function header(response, name) {
   return response.headers?.get(name) ?? ''
 }
 
-function hasUnquotedComma(value) {
-  let quoted = false
-  let escaped = false
-  for (const character of value) {
-    if (escaped) {
-      escaped = false
-      continue
-    }
-    if (quoted && character === '\\') {
-      escaped = true
-      continue
-    }
-    if (character === '"') quoted = !quoted
-    if (character === ',' && !quoted) return true
-  }
-  return false
-}
-
-function stableDiagnosticShape(etag) {
-  if (etag === null || hasUnquotedComma(etag)) return etag === null ? 'other' : 'list-valued'
-  if (DIAGNOSTIC_QUOTED_ETAG_PATTERN.test(etag)) return 'strong-quoted'
-  if (DIAGNOSTIC_WEAK_ETAG_PATTERN.test(etag)) return 'weak-quoted'
-  if (DIAGNOSTIC_BARE_ETAG_PATTERN.test(etag)) return 'bare'
-  return 'other'
-}
-
-function stableDiagnosticRecord(status, etag = null) {
-  const present = etag !== null
-  const length = present ? new TextEncoder().encode(etag).byteLength : 0
-  return {
-    status,
-    present,
-    shape: stableDiagnosticShape(etag),
-    length,
-    fingerprint: present ? createHash('sha256').update(etag).digest('hex').slice(0, 12) : null,
-  }
-}
-
-export function formatStableDiagnostic(record) {
-  return `${JSON.stringify({
-    status: record.status,
-    present: record.present,
-    shape: record.shape,
-    length: record.length,
-    fingerprint: record.fingerprint,
-  })}\n`
-}
-
 function etagDiagnostics(etag) {
   return {
     present: Boolean(etag),
@@ -242,15 +189,6 @@ function safeResponseError(operation, response) {
   return new PublicationError(
     retryable ? 'ambiguous-response' : 'request-failed',
     `${operation} request failed`,
-    { retryable, status: response.status },
-  )
-}
-
-function publicResponseError(operation, response, attempt) {
-  const retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500
-  return new PublicationError(
-    retryable ? 'ambiguous-response' : 'request-failed',
-    `${operation} request failed (status ${response.status}, attempt ${attempt})`,
     { retryable, status: response.status },
   )
 }
@@ -310,12 +248,14 @@ export async function validateAssets(directory, version) {
   if (pins.length !== 1 || pins[0] !== `default_version='${version}'`) {
     fail('invalid-assets', 'installer is not pinned to the requested version')
   }
-  return {
+  const inventory = {
     version,
     assets,
     manifest,
     manifest_sha256: manifestDigest(assets.SHA256SUMS),
   }
+  validatedInventories.add(inventory)
+  return inventory
 }
 
 function encodedURL(origin, key) {
@@ -327,31 +267,26 @@ function requireEnv(env, name) {
   return env[name]
 }
 
-export function createPublisherFromEnv(env = process.env, { fetchImpl = globalThis.fetch } = {}) {
+export function createPublisherFromEnv(env = process.env) {
   const accessKeyId = requireEnv(env, 'SNAPIFACT_R2_ACCESS_KEY_ID')
   const secretAccessKey = requireEnv(env, 'SNAPIFACT_R2_SECRET_ACCESS_KEY')
   const accountId = requireEnv(env, 'SNAPIFACT_R2_ACCOUNT_ID')
   const bucket = requireEnv(env, 'SNAPIFACT_R2_BUCKET')
-  const publicOrigin = requireEnv(env, 'SNAPIFACT_R2_PUBLIC_ORIGIN').replace(/\/+$/, '')
   const s3Origin = `https://${accountId}.r2.cloudflarestorage.com/${encodeURIComponent(bucket)}`
   const client = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto', retries: 0 })
   return new R2Publisher({
     s3Origin,
-    publicOrigin,
     signedFetch: (url, init) => client.fetch(url, init),
-    publicFetch: fetchImpl,
   })
 }
 
 export class R2Publisher {
-  constructor({ s3Origin, publicOrigin, signedFetch, publicFetch = globalThis.fetch }) {
-    if (!s3Origin || !publicOrigin || typeof signedFetch !== 'function' || typeof publicFetch !== 'function') {
+  constructor({ s3Origin, signedFetch }) {
+    if (!s3Origin || typeof signedFetch !== 'function') {
       fail('configuration', 'publication transport is not configured')
     }
     this.s3Origin = s3Origin.replace(/\/+$/, '')
-    this.publicOrigin = publicOrigin.replace(/\/+$/, '')
     this.signedFetch = signedFetch
-    this.publicFetch = publicFetch
   }
 
   signedURL(key) {
@@ -359,60 +294,11 @@ export class R2Publisher {
     return encodedURL(this.s3Origin, key)
   }
 
-  publicURL(key) {
-    if (!isAllowedKey(key)) fail('invalid-key', 'object key is not approved')
-    return encodedURL(this.publicOrigin, key)
-  }
-
   async signedRequest(method, key, init = {}) {
     try {
       return await this.signedFetch(this.signedURL(key), { ...init, method })
     } catch {
       throw new PublicationError('transport', `${method} request failed`, { retryable: true })
-    }
-  }
-
-  async publicRequest(method, key, { retry = false, retry404 = false } = {}) {
-    const url = this.publicURL(key)
-    if (!retry) {
-      try {
-        return await this.publicFetch(url, { method })
-      } catch {
-        throw new PublicationError('transport', `${method} public request failed`, { retryable: true })
-      }
-    }
-    for (let attempt = 1; attempt <= PUBLIC_MAX_ATTEMPTS; attempt += 1) {
-      const controller = new AbortController()
-      let timeout
-      try {
-        const response = await Promise.race([
-          this.publicFetch(url, { method, signal: controller.signal }),
-          new Promise((_, reject) => {
-            timeout = setTimeout(() => {
-              controller.abort()
-              reject(new Error('public request timed out'))
-            }, PUBLIC_REQUEST_TIMEOUT_MS)
-          }),
-        ])
-        const retryable = response.status === 404
-          ? retry404
-          : response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500
-        if (retryable && attempt < PUBLIC_MAX_ATTEMPTS) {
-          await new Promise((resolve) => setTimeout(resolve, PUBLIC_RETRY_DELAY_MS))
-          continue
-        }
-        if (retryable) throw publicResponseError(`public ${method}`, response, attempt)
-        if (!response.ok && response.status !== 404) throw publicResponseError(`public ${method}`, response, attempt)
-        return response
-      } catch (error) {
-        if (error instanceof PublicationError) throw error
-        if (attempt === PUBLIC_MAX_ATTEMPTS) {
-          throw new PublicationError('transport', `${method} public request failed (attempt ${attempt})`, { retryable: true })
-        }
-        await new Promise((resolve) => setTimeout(resolve, PUBLIC_RETRY_DELAY_MS))
-      } finally {
-        clearTimeout(timeout)
-      }
     }
   }
 
@@ -433,23 +319,13 @@ export class R2Publisher {
     return { bytes, get }
   }
 
-  async publicObject(key, expected, metadata, { retry = false, retry404 = false } = {}) {
-    const get = await this.publicRequest('GET', key, { retry, retry404 })
-    if (get.status === 404) return null
-    if (!get.ok) throw safeResponseError('public GET', get)
-    if (!validateMetadata(get, metadata)) fail('metadata-mismatch', 'public object metadata does not match')
-    const bytes = await responseBytes(get)
-    if (expected && !bytesEqual(bytes, expected)) fail('content-mismatch', 'public object bytes do not match')
-    return { bytes, head: get }
-  }
-
-  async verifyExactObject(key, expected, asset, { retry = false, retry404 = false } = {}) {
+  async verifyExactObject(key, expected, asset) {
     const metadata = objectMetadata(asset)
     return this.signedObjectGet(key, expected, metadata, { allowMissing: true })
   }
 
   async resolveExactAmbiguity(key, expected, asset) {
-    const match = await this.verifyExactObject(key, expected, asset, { retry: true, retry404: true })
+    const match = await this.verifyExactObject(key, expected, asset)
     if (match) return match
     fail('ambiguous-missing', 'conditional object write outcome is unknown', { retryable: true })
   }
@@ -471,10 +347,6 @@ export class R2Publisher {
     if (response.ok) return
     if (response.status === 412 || response.status >= 500) return this.resolveExactAmbiguity(key, bytes, asset)
     throw safeResponseError('exact object PUT', response)
-  }
-
-  async verifyLatestObject(key, expected, asset, { retry = false, retry404 = false } = {}) {
-    return this.publicObject(key, expected, objectMetadata(asset, { immutable: false }), { retry, retry404 })
   }
 
   async resolveMutableAmbiguity(key, bytes, asset) {
@@ -561,27 +433,6 @@ export class R2Publisher {
     }
     if (!bytesEqual(bytes, current.bytes)) stableProofFailure('body-mismatch', response.status)
     return { ...current, etag: candidate }
-  }
-
-  async diagnoseStableETag() {
-    try {
-      const response = await this.signedRequest('GET', 'channels/stable.json')
-      await response.arrayBuffer()
-      if (response.status === 404) return stableDiagnosticRecord('missing')
-      if (!response.ok) return stableDiagnosticRecord('request-failed')
-      return stableDiagnosticRecord('present', response.headers?.get('etag') ?? null)
-    } catch {
-      return stableDiagnosticRecord('request-failed')
-    }
-  }
-
-  async readStablePublic({ expected = false } = {}) {
-    const get = await this.publicRequest('GET', 'channels/stable.json', { retry: expected, retry404: expected })
-    if (get.status === 404) return null
-    if (!get.ok) throw safeResponseError('public stable GET', get)
-    if (!validateMetadata(get, stableMetadata())) fail('metadata-mismatch', 'public stable metadata does not match')
-    const bytes = await responseBytes(get)
-    return { ...parseStable(bytes), bytes, head: get }
   }
 
   async writeStable(stable, current, { allowConflict = true } = {}) {
@@ -712,34 +563,6 @@ export class R2Publisher {
     return { version, assets, manifest, manifest_sha256: manifestDigest(assets.SHA256SUMS) }
   }
 
-  async verifyPublicRelease(version) {
-    parseVersion(version)
-    const assets = {}
-    for (const asset of RELEASE_ASSETS) {
-      const key = keyForVersion(version, asset)
-      const object = await this.publicObject(key, undefined, objectMetadata(asset), { retry: true, retry404: true })
-      if (!object) fail('missing-object', 'immutable release object is missing', { retryable: true })
-      assets[asset] = object.bytes
-    }
-    const manifest = parseManifest(assets.SHA256SUMS)
-    for (const asset of CHECKSUM_ASSETS) {
-      if (manifest.get(asset) !== manifestDigest(assets[asset])) fail('content-mismatch', 'immutable release checksum mismatch')
-    }
-    const installer = decodeUTF8(assets['install.sh'], 'immutable installer is not valid UTF-8')
-    const pins = installer.match(/^default_version='([^']*)'$/gm) ?? []
-    if (pins.length !== 1 || pins[0] !== `default_version='${version}'`) {
-      fail('content-mismatch', 'immutable installer pin does not match')
-    }
-    return { version, assets, manifest, manifest_sha256: manifestDigest(assets.SHA256SUMS) }
-  }
-
-  async verifyLatest(verified) {
-    for (const asset of RELEASE_ASSETS) {
-      const object = await this.verifyLatestObject(keyForLatest(asset), verified.assets[asset], asset, { retry: true, retry404: true })
-      if (!object) fail('missing-object', 'latest release object is missing', { retryable: true })
-    }
-  }
-
   async verifyLatestSigned(verified) {
     for (const asset of RELEASE_ASSETS) {
       const object = await this.signedObjectGet(
@@ -779,25 +602,28 @@ export class R2Publisher {
     }
   }
 
-  async publish(version, assetsDirectory) {
-    const inventory = await validateAssets(assetsDirectory, version)
-    const prior = await this.readStableSigned({ allowMissing: true })
-    if (prior && compareVersions(version, prior.version) < 0) fail('stale-version', 'version is older than stable')
-    const precondition = await this.proveStablePrecondition(prior)
-    for (const asset of RELEASE_ASSETS) await this.putExact(keyForVersion(version, asset), inventory.assets[asset], asset)
-    const verified = await this.verifySignedRelease(version)
-    const stable = { version, manifest_sha256: verified.manifest_sha256, bytes: stableBytes(version, verified.manifest_sha256) }
+  async signedPromotion(verified, state) {
+    const { prior, precondition } = state ?? {
+      prior: await this.readStableSigned({ allowMissing: true }),
+      precondition: undefined,
+    }
+    const stablePrecondition = precondition ?? await this.proveStablePrecondition(prior)
+    const stable = {
+      version: verified.version,
+      manifest_sha256: verified.manifest_sha256,
+      bytes: stableBytes(verified.version, verified.manifest_sha256),
+    }
     let latestStarted = false
     try {
       latestStarted = true
       await this.refreshLatest(verified.assets)
-      await this.writeStable(stable, precondition)
+      await this.writeStable(stable, stablePrecondition)
       await this.verifyConvergence(verified)
-      return { version, manifest_sha256: verified.manifest_sha256 }
+      return { version: verified.version, manifest_sha256: verified.manifest_sha256 }
     } catch (error) {
       if (error.code === 'conditional-conflict') {
         if (await this.resolveStableConflict(stable, prior, error)) {
-          return { version, manifest_sha256: verified.manifest_sha256 }
+          return { version: verified.version, manifest_sha256: verified.manifest_sha256 }
         }
       }
       if (latestStarted && prior) await this.recoverLatest(prior)
@@ -805,13 +631,24 @@ export class R2Publisher {
     }
   }
 
+  async publish(version, inventory) {
+    if (!validatedInventories.has(inventory) || inventory.version !== version) {
+      fail('invalid-assets', 'publication requires a validated release inventory')
+    }
+    const prior = await this.readStableSigned({ allowMissing: true })
+    if (prior && compareVersions(version, prior.version) < 0) fail('stale-version', 'version is older than stable')
+    const precondition = await this.proveStablePrecondition(prior)
+    for (const asset of RELEASE_ASSETS) await this.putExact(keyForVersion(version, asset), inventory.assets[asset], asset)
+    const verified = await this.verifySignedRelease(version)
+    return this.signedPromotion(verified, { prior, precondition })
+  }
+
   async verify(version) {
-    const verified = await this.verifyPublicRelease(version)
-    await this.verifyLatest(verified)
+    const verified = await this.verifySignedRelease(version)
+    await this.verifyLatestSigned(verified)
     const signedStable = await this.readStableSigned()
-    const publicStable = await this.readStablePublic({ expected: true })
     const expected = stableBytes(version, verified.manifest_sha256)
-    if (!publicStable || !bytesEqual(publicStable.bytes, expected) || !bytesEqual(signedStable.bytes, expected)) {
+    if (!bytesEqual(signedStable.bytes, expected)) {
       fail('convergence-failed', 'release state does not converge')
     }
     return { version, manifest_sha256: verified.manifest_sha256 }
@@ -819,35 +656,13 @@ export class R2Publisher {
 
   async rollback(version) {
     const verified = await this.verifySignedRelease(version)
-    const prior = await this.readStableSigned({ allowMissing: true })
-    const precondition = await this.proveStablePrecondition(prior)
-    let latestStarted = false
-    const stable = { version, manifest_sha256: verified.manifest_sha256, bytes: stableBytes(version, verified.manifest_sha256) }
-    try {
-      latestStarted = true
-      await this.refreshLatest(verified.assets)
-      await this.writeStable(stable, precondition)
-      await this.verifyConvergence(verified)
-      return { version, manifest_sha256: verified.manifest_sha256 }
-    } catch (error) {
-      if (error.code === 'conditional-conflict') {
-        if (await this.resolveStableConflict(stable, prior, error)) {
-          return { version, manifest_sha256: verified.manifest_sha256 }
-        }
-      }
-      if (latestStarted && prior) await this.recoverLatest(prior)
-      throw error
-    }
+    return this.signedPromotion(verified)
   }
 }
 
 export function parseArguments(argv) {
   const [command, ...args] = argv
   if (!COMMANDS.includes(command)) fail('usage', 'command is not approved')
-  if (command === 'stable-diagnostic') {
-    if (args.length) fail('usage', 'stable diagnostic accepts no arguments')
-    return { command }
-  }
   const values = {}
   for (let i = 0; i < args.length; i += 1) {
     const flag = args[i]
@@ -872,30 +687,20 @@ export function sanitizeError(error) {
 
 export async function run(argv, {
   env = process.env,
-  fetchImpl = globalThis.fetch,
   publisherFactory = createPublisherFromEnv,
-  writeOutput = (text) => process.stdout.write(text),
 } = {}) {
   let command
   try {
     command = parseArguments(argv)
-    if (command.command === 'stable-diagnostic') {
-      const publisher = publisherFactory(env, { fetchImpl })
-      const result = await publisher.diagnoseStableETag()
-      writeOutput(formatStableDiagnostic(result))
-      return result.status === 'request-failed' ? 1 : 0
-    }
-    if (command.command === 'publish') await validateAssets(command.assets, command.version)
-    const publisher = publisherFactory(env, { fetchImpl })
-    if (command.command === 'publish') await publisher.publish(command.version, command.assets)
+    const inventory = command.command === 'publish'
+      ? await validateAssets(command.assets, command.version)
+      : undefined
+    const publisher = publisherFactory(env)
+    if (command.command === 'publish') await publisher.publish(command.version, inventory)
     if (command.command === 'verify') await publisher.verify(command.version)
     if (command.command === 'rollback') await publisher.rollback(command.version)
     return 0
   } catch (error) {
-    if (command?.command === 'stable-diagnostic') {
-      writeOutput(formatStableDiagnostic(stableDiagnosticRecord('request-failed')))
-      return 1
-    }
     process.stderr.write(`publish-r2: ${sanitizeError(error)}\n`)
     return 1
   }

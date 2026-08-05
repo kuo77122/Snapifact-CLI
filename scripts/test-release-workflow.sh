@@ -47,8 +47,6 @@ require "$workflow" 'install.sh'
 require "$workflow" 'publish-r2.mjs publish'
 require "$workflow" 'publish-r2.mjs verify'
 require "$workflow" 'publish-r2.mjs rollback'
-require "$workflow" 'stable-diagnostic'
-require "$workflow" 'node scripts/publish-r2.mjs stable-diagnostic'
 require "$workflow" 'environment: r2-release-production'
 require "$workflow" "artifact_digest: sha256:\${{ steps.provenance_artifact.outputs.artifact-digest }}"
 require "$workflow" 'jq -r '\''.digest'\'' <<<"$artifact")" == "$PRODUCTION_ARTIFACT_DIGEST" ]]'
@@ -60,7 +58,10 @@ fi
 require "$workflow" 'needs: [verify, publish]'
 require "$workflow" 'needs: [publish-production, publish]'
 require "$workflow" 'gh release edit "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --draft=false'
-require "$workflow" 'mutation_succeeded=true'
+
+if [[ "$workflow" == *'SNAPIFACT_R2_PUBLIC_ORIGIN'* || "$workflow" == *'diagnostic'* || "$workflow" == *'Compensate to previously verified stable release'* || "$workflow" == *'Go install version smoke'* ]]; then
+  fail 'removed public, diagnostic, Go smoke, or compensation path is present'
+fi
 
 if [[ "$workflow" == *'inputs.environment'* || "$workflow" == *'inputs.bucket'* || "$workflow" == *'inputs.public_origin'* ]]; then
 	fail 'generic environment selector is present'

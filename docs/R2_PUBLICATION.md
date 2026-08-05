@@ -1,201 +1,99 @@
 # R2 publication boundaries
 
-This repository contains the fixed-key publication helper, one protected
-Preview rehearsal, and one protected signed-read-only stable validator
-diagnostic. Local and contributor workflows never resolve R2 credentials or
-send signed requests.
+The standalone helper is authoritative for signed R2 exact, latest, and stable
+state. It accepts only fixed release keys and metadata, writes immutable exact
+objects with `If-None-Match: *`, promotes latest before stable, and uses stable
+ETag/CAS as the final commit point. Ambiguous writes use signed readback and
+fail closed; partial mutable promotion recovers to the observed prior stable
+release.
 
-## Active Production boundary
+## Production boundary
 
-FAT-484 activates the reviewed Production path by removing only its inert
-guard. The remaining predicate is deliberately narrow: the repository owner
-must push a canonical `vMAJOR.MINOR.PATCH` tag to `kuo77122/Snapifact-CLI`,
-verification must pass, and the draft publication job must succeed. Pull
-requests, forks, branches, manual inputs, mutable refs, and failed
-dependencies cannot select it.
+Production is reachable only when the repository owner pushes a canonical
+`vMAJOR.MINOR.PATCH` tag to `kuo77122/Snapifact-CLI`, the canonical tag checks
+pass, and the draft publication job succeeds. It uses the literal
+`r2-release-production` environment, non-canceling concurrency, pinned actions,
+least privilege, exact event-SHA checkout, and `npm ci`.
 
-The active job is bound literally to `r2-release-production`, uses a
-non-canceling concurrency group, and has only `contents: read` and
-`actions: read`. It checks out the exact event SHA and proves the tag commit,
-then downloads only the current run's provenance artifact by the publish-job
-output ID. It checks the artifact run, name, expiration state, platform digest,
-fresh archive digest, exact six-file inventory, installer pin, and recomputed
-asset digest set before accessing the protected environment.
+The publication job creates one draft Release with exactly these six assets:
 
-The one credential-bearing publication step first reads the canonical public
-`channels/stable.json` index, requires exactly `version` and `manifest_sha256`,
-and verifies that previously stable version with the fixed helper. It publishes
-the candidate once, marks mutation success only after that command returns, and
-then verifies the candidate. Credential-free smoke fetches the canonical
-versioned installer, installs into a temporary directory, checks exact
-`snapifact vMAJOR.MINOR.PATCH` output, and runs the matching `go install`
-version check. If verification or smoke fails after a successful publish,
-exactly one compensation step rolls back to the previously verified stable
-version and verifies it. The candidate is never retried.
+1. `snapifact_linux_amd64`
+2. `snapifact_linux_arm64`
+3. `snapifact_darwin_amd64`
+4. `snapifact_darwin_arm64`
+5. `SHA256SUMS`
+6. `install.sh`
 
-The separate finalizer has only `contents: write` and no Production environment
-or R2 values. It runs only after Production succeeds, rechecks the matching
-draft Release, canonical tag and event SHA, exact six assets, and digest set,
-then undrafts that one release. It has no `always()` or bypass path. Any
-finalizer failure leaves the Release draft and requires a separately approved
-finalize-or-rollback decision.
+The Production job revalidates the current run's artifact ID, run, name,
+expiration, REST digest, archive digest, exact six-file inventory, checksums,
+installer pin, tag SHA, and asset digest set before credential-bearing
+publication. The helper validates the same six-file inventory once before
+publisher construction and receives that validated inventory directly.
 
-### Correction history and fresh `v0.3.1` release gates
+Production calls signed `publish` once. A successful helper call means exact,
+latest, and stable signed state converged; there is no public stable
+prerequisite, duplicate helper verification, or workflow compensation.
 
-The `v0.2.4` attempt failed closed in run `30975075137` during current-run
-provenance revalidation, before the credential-bearing step. The upload action
-exposed a raw SHA-256 hex digest while the REST artifact and downloaded archive
-checks use the canonical `sha256:<hex>` form. The publish output now adds that
-prefix exactly once at the job boundary; the Production consumer still requires
-literal equality with both the REST `.digest` and the downloaded ZIP checksum.
+After signed publication, one canonical installer smoke runs without R2
+credentials and is `continue-on-error`. Its current impact is delayed public
+visibility without corrupting signed state. Make it blocking only if measured
+user-facing propagation failures become common or a release SLO is adopted.
 
-`v0.2.4` is abandoned as a release candidate. Its tag and draft Release remain
-untouched, its provenance artifact remains an audit record, all six exact
-`v0.2.4` objects remain absent, and public exact/latest/stable remains healthy
-`v0.2.2`. Do not rerun, move, delete, replace, or clean up `v0.2.4`.
+Finalization runs only after Production success, has `contents: write` only,
+and checks the exact versioned draft, canonical tag binding, and six asset names
+before undrafting. It does not download or hash the assets a second time.
 
-The `v0.3.0` attempt failed closed in run `30992808159` during current-run
-provenance revalidation after the prefixed digest checks passed. The failure was
-the missing declared `aws4fetch` dependency before credential-bearing
-publication; all six exact `v0.3.0` objects remain absent, public latest/stable
-remain healthy `v0.2.2`, and its tag and six-asset draft remain untouched. Do
-not rerun, move, delete, replace, or clean up `v0.3.0`.
+## Preview rehearsal
 
-The fresh candidate is `v0.3.1`, created only at the correction #3 merge SHA.
-Its gates are separate and ordered:
+Dispatch **Release** from standalone `main` as the repository owner with a
+canonical version and `preview` operation. Preview uses
+`r2-release-preview`, preserves exact dispatch-SHA and provenance isolation,
+and independently selects one successful, non-expired current provenance
+artifact. It verifies the tag, run, artifact ID and digest, archive digest,
+exact six-file inventory, checksums, installer pin, and asset digest set before
+accessing signed R2 values.
 
-1. Planner proves the correction merge SHA and green configured checks.
-2. The owner separately authorizes and creates/pushes `v0.3.1` at that exact
-   SHA. This workflow does not create tags.
-3. The new tag run creates its own draft Release, revalidates six assets, and
-   uploads its own current-run provenance artifact with the canonical prefixed
-   digest.
-4. Before Production approval, Planner rechecks the new tag/run/artifact/SHA,
-   exact six digests, draft identity, and healthy unchanged `v0.2.2` state.
-5. The owner separately approves the waiting `r2-release-production`
-   deployment.
-6. The workflow verifies prior stable, publishes `v0.3.1` once, verifies it,
-   performs the existing credential-free installer and `go install` smoke, and
-   compensates once only if publication succeeded and a later check fails.
-7. The finalizer undrafts the matching `v0.3.1` Release only after complete
-   Production success.
+The rehearsal runs signed `publish`, `verify`, `rollback`, and `verify`. It does
+not read public release state. Weak ETags are proved with a signed conditional
+read; malformed validators stop before mutation. Strong and weak validators,
+conditional conflicts, ambiguous outcomes, stable-last ordering, and recovery
+remain covered by the helper tests.
 
-Repository rulesets and classic `main` protection are intentionally deferred at
-the current single-writer scale. Accepted compensating controls are one
-reviewed PR, current-head review, green `go` and `Verify (ubuntu-latest)`
-checks, exact tag/SHA/provenance gates, and the required Production reviewer.
-Paid immutable-tag and required-check enforcement becomes mandatory before a
-second writer or write-capable automation, or before another Production release
-after `v0.3.0`. FAT-484 release and recovery rely only on the reviewed
-standalone workflow/helper/runbook; do not assume or recreate Core rollback.
+## Manual rollback
 
-Calling `publish` may write immutable exact `downloads/v0.3.1/*` objects before
-returning. Rollback never deletes or overwrites exact history; it restores only
-mutable latest/stable to the verified `v0.2.2` state. These outcomes remain
-distinct and require no retry or delete behavior:
+Rollback is an explicit operator command against a previously verified
+immutable version:
 
-- no exact candidate residue and healthy `v0.2.2`: leave the draft and stop;
-- all present exact candidate objects match the approved digests and healthy
-  `v0.2.2`: record irreversible residue, leave the draft, and require a
-  separately approved replan before any same-version rerun or replacement;
-- partial or mismatched exact candidate objects: stop as an immutable-version
-  incident and never overwrite, delete, or reuse `v0.3.1` without a separate
-  recovery decision;
-- unproven prior `v0.2.2` latest/stable: stop and require a separate recovery
-  decision using only reviewed standalone behavior; do not assume or recreate
-  Core rollback;
-- after `mutation_succeeded=true`, allow the existing one-time mutable
-  compensation; failed compensation or finalization leaves the draft and
-  requires a separately approved finalize-or-rollback decision.
+```sh
+node scripts/publish-r2.mjs verify --version vMAJOR.MINOR.PATCH
+node scripts/publish-r2.mjs rollback --version vMAJOR.MINOR.PATCH
+node scripts/publish-r2.mjs verify --version vMAJOR.MINOR.PATCH
+```
 
-Stop on scope drift, changed head, missing or failed checks, mutation of the
-abandoned `v0.2.4` or `v0.3.0` tag/draft/artifact, a pre-existing `v0.3.1` tag/Release/object,
-unresolved gate timing, unexpected environment or credential names,
-tag/run/artifact/SHA/digest drift, partial or mismatched residue, public/signed
-divergence, latest/stable non-convergence, unavailable rollback, or any
-deployment requirement outside this workflow. Record only sanitized job, run,
-artifact, SHA, digest, command outcome, and convergence evidence; never record
-credentials, private values, raw bodies, signed material, URLs with credentials,
-or asset bytes.
+Rollback reads and verifies every immutable object, never overwrites or deletes
+exact history, then restores mutable latest/stable through the same signed
+promotion path. Do not retry a failed exact write or reuse a version with
+unknown immutable residue.
 
-## Before dispatch
+## Failed candidates and fresh versions
 
-The owner must configure the literal `r2-release-preview` environment after
-merge with only these values:
+Failed `v0.2.4`, `v0.3.0`, and `v0.3.1` tags, drafts, artifacts, and object
+history remain untouched. Production remains `v0.2.2` until a separately
+approved fresh version is selected. A candidate with exact residue requires a
+separate recovery decision and a fresh version; exact objects are never
+overwritten, deleted, or retried automatically.
 
-- Secrets: `SNAPIFACT_R2_ACCESS_KEY_ID`, `SNAPIFACT_R2_SECRET_ACCESS_KEY`
-- Variables: `SNAPIFACT_R2_ACCOUNT_ID`, `SNAPIFACT_R2_BUCKET`,
-  `SNAPIFACT_R2_PUBLIC_ORIGIN`
-
-Use a dedicated Preview bucket and require owner approval. Do not configure
-repository-scoped credentials or production values. Future canonical tag
-publishes create the draft, re-download and validate exactly six release files,
-then upload those files as one immutable artifact named
-`release-provenance-vMAJOR.MINOR.PATCH`. The artifact is the only Preview byte
-source; Preview never reads the draft release.
-
-The owner may separately dispatch the literal `legacy-backfill` operation only
-for `v0.2.3`. It checks out tag SHA
-`8ece01f324f5d6f37a120b5efcbb3796fa6eab6e`, rebuilds and validates the six
-files, compares them with `release-provenance/v0.2.3.json`, and uploads the
-same artifact shape. A mismatch uploads nothing.
-
-## Rehearsal flow
-
-Dispatch **Release** from standalone `main` as the repository owner with the
-canonical release version and `preview` operation. The workflow:
-
-1. checks out the dispatch `github.sha`, never the version tag, for trusted
-   helper/workflow code;
-2. resolves the canonical tag commit and selects exactly one successful,
-   non-expired version-named artifact from the matching owner run;
-3. verifies run identity, artifact ID, GitHub artifact SHA-256, exact six-file
-   inventory, checksums, and installer version pin in a fresh local directory;
-4. requests the protected Preview environment only after preflight succeeds;
-5. independently selects the same unique run and artifact, rechecks every
-   identity/digest/inventory invariant, and publishes only from that directory;
-6. runs `publish`, public `verify`, matching `publish` retry, public `verify`,
-   same-version `rollback`, and final public `verify` from that directory.
-
-To diagnose the stable validator instead, dispatch the literal
-`stable-diagnostic` operation without a version. Before the protected Preview
-values are available, it proves the checked-out 40-hex SHA is the repository's
-dispatch-time `origin/main` commit and is reachable from fetched `main`. The
-final step performs exactly one signed GET for the literal
-`channels/stable.json` key and emits only the status, validator presence,
-mutually exclusive shape, byte length, and first 12 lowercase SHA-256
-characters of the validator. It never emits the validator, body, URL,
-credentials, headers, account, bucket, or origin.
-
-During publication, a valid weak-quoted stable validator is reduced only by
-removing its exact `W/` prefix. Before any exact or mutable object write, the
-helper performs one signed conditional GET for the same fixed key using that
-candidate. It proceeds only when the response succeeds, has the approved
-stable metadata and canonical schema, and has bytes identical to the initial
-stable read. The unchanged candidate is then used for the final stable PUT;
-proof failures stop without mutation, and a final 412 uses the existing
-compensation path without retrying the stable PUT.
-
-No PR, fork, ordinary push, non-main ref, non-owner dispatch, noncanonical
-version, tag drift, missing/failed/multiple/ambiguous/expired artifact,
-artifact digest drift, inventory drift, or asset digest drift can reach the
-credential-bearing step. Manual Preview dispatch has only `contents: read` and
-`actions: read`; the legacy job has only `actions: write` as a write
-capability, plus checkout-required `contents: read`. Neither path can create
-or edit a GitHub Release.
+The current one-writer tradeoff accepts unprotected refs. Add repository
+enforcement before a second writer or write-capable automation. Restore finalizer
+digest revalidation before a second writer can change a draft, or after any
+observed draft drift. Restore workflow-level compensation only if a new
+blocking post-publication mutation is introduced.
 
 ## Stop conditions
 
-Stop before signed access on any preflight or independent revalidation
-failure. The helper never overwrites an existing mismatched exact object,
-lists or deletes objects, accepts arbitrary keys, or falls back to production.
-Do not retry a failed compensation or remove an unexpected anonymous-write
-canary automatically; record the sanitized failure and obtain owner
-remediation approval.
-
-Record only the workflow/job identity, run/artifact identity and digest,
-dispatch SHA, tag SHA, six digests, command outcomes, and exact/latest/stable
-convergence results. Never record credentials, authorization or signature
-material, signed URLs, raw bodies, asset bytes, private endpoints, or
-secret-derived values. This ticket does not configure environments or perform
-a live Preview run.
+Stop on scope drift, changed head, missing or failed checks, tag/SHA/artifact or
+digest drift, partial or mismatched exact residue, public/signed divergence,
+latest/stable non-convergence, unavailable rollback, unexpected environment or
+credential names, or any live release action without separate owner approval.
+Never record credentials, signed material, raw response bodies, private values,
+or asset bytes.
