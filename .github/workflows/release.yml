@@ -68,7 +68,7 @@ jobs:
       run_id: ${{ github.run_id }}
       tag_sha: ${{ github.sha }}
       artifact_id: ${{ steps.provenance_artifact.outputs.artifact-id }}
-      artifact_digest: ${{ steps.provenance_artifact.outputs.artifact-digest }}
+      artifact_digest: sha256:${{ steps.provenance_artifact.outputs.artifact-digest }}
       artifact_name: release-provenance-${{ github.ref_name }}
       digest_set: ${{ steps.draft_assets.outputs.digest_set }}
     permissions:

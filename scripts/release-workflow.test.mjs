@@ -179,7 +179,7 @@ test('Production publication is active and reachable only from the canonical tag
 test('Production revalidates the current-run provenance and six immutable release assets', () => {
   assert.match(publish, /tag_sha: \$\{\{ github\.sha \}\}/)
   assert.match(publish, /artifact_id: \$\{\{ steps\.provenance_artifact\.outputs\.artifact-id \}\}/)
-  assert.match(publish, /artifact_digest: \$\{\{ steps\.provenance_artifact\.outputs\.artifact-digest \}\}/)
+  assert.match(publish, /artifact_digest: sha256:\$\{\{ steps\.provenance_artifact\.outputs\.artifact-digest \}\}/)
   assert.match(publish, /digest_set: \$\{\{ steps\.draft_assets\.outputs\.digest_set \}\}/)
   assert.match(production, /actions\/artifacts\/\$PRODUCTION_ARTIFACT_ID\/zip/)
   assert.match(production, /PRODUCTION_RUN_ID.*needs\.publish\.outputs\.run_id/)
@@ -189,6 +189,11 @@ test('Production revalidates the current-run provenance and six immutable releas
   assert.match(production, /for asset in snapifact_linux_amd64 snapifact_linux_arm64 snapifact_darwin_amd64 snapifact_darwin_arm64 SHA256SUMS install\.sh/)
   assert.match(production, /digest_set.*PRODUCTION_DIGEST_SET|PRODUCTION_DIGEST_SET.*digest_set/)
   assert.match(production, /default_version=|RELEASE_VERSION/)
+})
+
+test('Production preserves exact REST and downloaded archive digest comparisons', () => {
+  assert.match(production, /\[\[ "\$\(jq -r '\.digest' <<<"\$artifact"\)" == "\$PRODUCTION_ARTIFACT_DIGEST" \]\]/)
+  assert.match(production, /\[\[ "sha256:\$\(sha256sum "\$archive" \| cut -d ' ' -f1\)" == "\$PRODUCTION_ARTIFACT_DIGEST" \]\]/)
 })
 
 test('Production verifies prior stable, publishes once, and compensates only after publish success', () => {
