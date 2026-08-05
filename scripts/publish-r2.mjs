@@ -271,6 +271,8 @@ function requireValidatedInventory(inventory, version) {
     && inventory.version === snapshot.version
     && inventory.manifest_sha256 === snapshot.manifest_sha256
     && inventory.assets
+    && Object.keys(inventory.assets).length === RELEASE_ASSETS.length
+    && Object.keys(inventory.assets).every((asset) => RELEASE_ASSETS.includes(asset))
     && RELEASE_ASSETS.every((asset) => inventory.assets[asset] instanceof Uint8Array
       && bytesEqual(inventory.assets[asset], snapshot.assets[asset]))
     && inventory.manifest instanceof Map
