@@ -40,7 +40,7 @@ then undrafts that one release. It has no `always()` or bypass path. Any
 finalizer failure leaves the Release draft and requires a separately approved
 finalize-or-rollback decision.
 
-### Correction status and fresh release gates
+### Correction history and fresh `v0.3.1` release gates
 
 The `v0.2.4` attempt failed closed in run `30975075137` during current-run
 provenance revalidation, before the credential-bearing step. The upload action
@@ -54,11 +54,18 @@ untouched, its provenance artifact remains an audit record, all six exact
 `v0.2.4` objects remain absent, and public exact/latest/stable remains healthy
 `v0.2.2`. Do not rerun, move, delete, replace, or clean up `v0.2.4`.
 
-The fresh candidate is `v0.3.0`, created only at the correction PR's future
-merge SHA. Its gates are separate and ordered:
+The `v0.3.0` attempt failed closed in run `30992808159` during current-run
+provenance revalidation after the prefixed digest checks passed. The failure was
+the missing declared `aws4fetch` dependency before credential-bearing
+publication; all six exact `v0.3.0` objects remain absent, public latest/stable
+remain healthy `v0.2.2`, and its tag and six-asset draft remain untouched. Do
+not rerun, move, delete, replace, or clean up `v0.3.0`.
+
+The fresh candidate is `v0.3.1`, created only at the correction #3 merge SHA.
+Its gates are separate and ordered:
 
 1. Planner proves the correction merge SHA and green configured checks.
-2. The owner separately authorizes and creates/pushes `v0.3.0` at that exact
+2. The owner separately authorizes and creates/pushes `v0.3.1` at that exact
    SHA. This workflow does not create tags.
 3. The new tag run creates its own draft Release, revalidates six assets, and
    uploads its own current-run provenance artifact with the canonical prefixed
@@ -67,10 +74,10 @@ merge SHA. Its gates are separate and ordered:
    exact six digests, draft identity, and healthy unchanged `v0.2.2` state.
 5. The owner separately approves the waiting `r2-release-production`
    deployment.
-6. The workflow verifies prior stable, publishes `v0.3.0` once, verifies it,
+6. The workflow verifies prior stable, publishes `v0.3.1` once, verifies it,
    performs the existing credential-free installer and `go install` smoke, and
    compensates once only if publication succeeded and a later check fails.
-7. The finalizer undrafts the matching `v0.3.0` Release only after complete
+7. The finalizer undrafts the matching `v0.3.1` Release only after complete
    Production success.
 
 Repository rulesets and classic `main` protection are intentionally deferred at
@@ -82,7 +89,7 @@ second writer or write-capable automation, or before another Production release
 after `v0.3.0`. FAT-484 release and recovery rely only on the reviewed
 standalone workflow/helper/runbook; do not assume or recreate Core rollback.
 
-Calling `publish` may write immutable exact `downloads/v0.3.0/*` objects before
+Calling `publish` may write immutable exact `downloads/v0.3.1/*` objects before
 returning. Rollback never deletes or overwrites exact history; it restores only
 mutable latest/stable to the verified `v0.2.2` state. These outcomes remain
 distinct and require no retry or delete behavior:
@@ -92,7 +99,7 @@ distinct and require no retry or delete behavior:
   `v0.2.2`: record irreversible residue, leave the draft, and require a
   separately approved replan before any same-version rerun or replacement;
 - partial or mismatched exact candidate objects: stop as an immutable-version
-  incident and never overwrite, delete, or reuse `v0.3.0` without a separate
+  incident and never overwrite, delete, or reuse `v0.3.1` without a separate
   recovery decision;
 - unproven prior `v0.2.2` latest/stable: stop and require a separate recovery
   decision using only reviewed standalone behavior; do not assume or recreate
@@ -102,7 +109,7 @@ distinct and require no retry or delete behavior:
   requires a separately approved finalize-or-rollback decision.
 
 Stop on scope drift, changed head, missing or failed checks, mutation of the
-abandoned `v0.2.4` tag/draft/artifact, a pre-existing `v0.3.0` tag/Release/object,
+abandoned `v0.2.4` or `v0.3.0` tag/draft/artifact, a pre-existing `v0.3.1` tag/Release/object,
 unresolved gate timing, unexpected environment or credential names,
 tag/run/artifact/SHA/digest drift, partial or mismatched residue, public/signed
 divergence, latest/stable non-convergence, unavailable rollback, or any

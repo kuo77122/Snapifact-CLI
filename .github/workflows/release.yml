@@ -174,6 +174,8 @@ jobs:
         with:
           node-version: 26.4.0
           cache: npm
+      - name: Install publication dependencies
+        run: npm ci
       - id: assets
         name: Revalidate current-run Production provenance
         env:
