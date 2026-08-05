@@ -79,7 +79,8 @@ reviewed PR, current-head review, green `go` and `Verify (ubuntu-latest)`
 checks, exact tag/SHA/provenance gates, and the required Production reviewer.
 Paid immutable-tag and required-check enforcement becomes mandatory before a
 second writer or write-capable automation, or before another Production release
-after `v0.3.0`. Core rollback remains retained; FAT-485 does not retire it.
+after `v0.3.0`. FAT-484 release and recovery rely only on the reviewed
+standalone workflow/helper/runbook; do not assume or recreate Core rollback.
 
 Calling `publish` may write immutable exact `downloads/v0.3.0/*` objects before
 returning. Rollback never deletes or overwrites exact history; it restores only
@@ -93,8 +94,9 @@ distinct and require no retry or delete behavior:
 - partial or mismatched exact candidate objects: stop as an immutable-version
   incident and never overwrite, delete, or reuse `v0.3.0` without a separate
   recovery decision;
-- unproven prior `v0.2.2` latest/stable: stop and obtain separate owner
-  approval for the FAT-512-aligned Core rollback path;
+- unproven prior `v0.2.2` latest/stable: stop and require a separate recovery
+  decision using only reviewed standalone behavior; do not assume or recreate
+  Core rollback;
 - after `mutation_succeeded=true`, allow the existing one-time mutable
   compensation; failed compensation or finalization leaves the draft and
   requires a separately approved finalize-or-rollback decision.
