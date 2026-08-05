@@ -16,7 +16,7 @@ const CHECKSUM_ASSETS = Object.freeze([...BINARY_ASSETS, 'install.sh'])
 const VERSION_PATTERN = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
 const HEX_PATTERN = /^[0-9a-f]{64}$/
 const ETAG_PATTERN = /^"(?:[^"\\\r\n]|\\.)+"$/
-const validatedInventories = new WeakSet()
+const validatedInventorySnapshots = new WeakMap()
 
 export const CONTENT_TYPES = Object.freeze({
   snapifact_linux_amd64: 'application/octet-stream',
@@ -254,8 +254,29 @@ export async function validateAssets(directory, version) {
     manifest,
     manifest_sha256: manifestDigest(assets.SHA256SUMS),
   }
-  validatedInventories.add(inventory)
+  const snapshot = {
+    version,
+    manifest_sha256: inventory.manifest_sha256,
+    assets: Object.fromEntries(RELEASE_ASSETS.map((asset) => [asset, new Uint8Array(assets[asset])])),
+    manifest: new Map(manifest),
+  }
+  validatedInventorySnapshots.set(inventory, snapshot)
   return inventory
+}
+
+function requireValidatedInventory(inventory, version) {
+  const snapshot = validatedInventorySnapshots.get(inventory)
+  if (!snapshot) fail('invalid-assets', 'publication requires a validated release inventory')
+  const unchanged = inventory.version === version
+    && inventory.version === snapshot.version
+    && inventory.manifest_sha256 === snapshot.manifest_sha256
+    && inventory.assets
+    && RELEASE_ASSETS.every((asset) => inventory.assets[asset] instanceof Uint8Array
+      && bytesEqual(inventory.assets[asset], snapshot.assets[asset]))
+    && inventory.manifest instanceof Map
+    && inventory.manifest.size === snapshot.manifest.size
+    && [...snapshot.manifest].every(([asset, digest]) => inventory.manifest.get(asset) === digest)
+  if (!unchanged) fail('invalid-assets', 'validated release inventory changed')
 }
 
 function encodedURL(origin, key) {
@@ -632,9 +653,7 @@ export class R2Publisher {
   }
 
   async publish(version, inventory) {
-    if (!validatedInventories.has(inventory) || inventory.version !== version) {
-      fail('invalid-assets', 'publication requires a validated release inventory')
-    }
+    requireValidatedInventory(inventory, version)
     const prior = await this.readStableSigned({ allowMissing: true })
     if (prior && compareVersions(version, prior.version) < 0) fail('stale-version', 'version is older than stable')
     const precondition = await this.proveStablePrecondition(prior)

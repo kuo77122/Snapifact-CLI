@@ -813,6 +813,28 @@ test('direct publication rejects an inventory that was not validated by the help
   assert.equal(fake.signedCalls.length, 0)
 })
 
+test('rejects a coherently mutated validated inventory before any signed request', async () => {
+  const directory = await createReleaseAssets('v0.2.2')
+  const inventory = await validateAssets(directory, 'v0.2.2')
+  const mutatedInstaller = new Uint8Array(inventory.assets['install.sh'])
+  mutatedInstaller[0] ^= 1
+  inventory.assets['install.sh'] = mutatedInstaller
+  inventory.manifest.set('install.sh', manifestDigest(mutatedInstaller))
+  const manifest = `${RELEASE_ASSETS
+    .filter((asset) => asset !== 'SHA256SUMS')
+    .map((asset) => `${inventory.manifest.get(asset)}  ${asset}`)
+    .join('\n')}\n`
+  inventory.assets.SHA256SUMS = new TextEncoder().encode(manifest)
+  inventory.manifest_sha256 = manifestDigest(inventory.assets.SHA256SUMS)
+
+  const fake = fakeR2()
+  await assert.rejects(
+    fake.publisher.publish('v0.2.2', inventory),
+    /validated release inventory changed/,
+  )
+  assert.equal(fake.signedCalls.length, 0)
+})
+
 test('release workflow keeps draft creation tag-push-only and preview owner-gated', async () => {
   const workflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8')
   assert.match(workflow, /workflow_dispatch:/)
