@@ -38,6 +38,11 @@ Rules:
 
 Options:
   --version  print the CLI version and exit
+  --title <text>                 set the snapshot title
+  --description-file <path|->    read the markdown description from path; - reads it from stdin
+  --json                         output the full JSON response instead of only the snapshot URL
+
+  --description-file - reads the description from stdin and cannot be combined with content also read from stdin.
 
 Examples:
   printf 'content\n' | snapifact markdown
@@ -413,7 +418,7 @@ func runDelete(args []string, stdout, stderr io.Writer) int {
 		}
 		return 1
 	}
-	if flags.NArg() == 0 {
+	if flags.NArg() != 1 {
 		fmt.Fprintln(stderr, "usage: snapifact delete <id-or-url>")
 		return 1
 	}

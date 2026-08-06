@@ -1304,6 +1304,39 @@ func TestDeleteWithoutArgsShowsUsage(t *testing.T) {
 	}
 }
 
+func TestDeleteWithExtraOperandFailsBeforeSideEffects(t *testing.T) {
+	_, server, cleanup := testHarness(t)
+	defer cleanup()
+
+	snapshotID, token := server.SeedSnapshot(t)
+	stateDir := os.Getenv("SNAPIFACT_STATE_DIR")
+	tokenDir := filepath.Join(stateDir, "snapifact", "tokens")
+	if err := os.MkdirAll(tokenDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(tokenDir, snapshotID)
+	if err := os.WriteFile(tokenPath, []byte(token), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"delete", snapshotID, "extra"}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("delete with extra operand unexpectedly succeeded")
+	}
+	if !strings.Contains(strings.ToLower(stderr.String()), "usage") {
+		t.Fatalf("stderr = %q, want usage error", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if server.RequestCount() != 0 {
+		t.Fatalf("HTTP request count = %d, want 0", server.RequestCount())
+	}
+	if content, err := os.ReadFile(tokenPath); err != nil || string(content) != token {
+		t.Fatalf("token changed: content=%q err=%v", content, err)
+	}
+}
+
 func TestGlobalHelpContract(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exitCode := run([]string{"--help"}, nil, &stdout, &stderr); exitCode != 0 {
@@ -1317,6 +1350,11 @@ func TestGlobalHelpContract(t *testing.T) {
 		"stdin",
 		"Options may appear before or after operands",
 		"-- before a dash-prefixed path",
+		"--title <text>",
+		"--description-file <path|->",
+		"--json",
+		"--description-file - reads the description from stdin",
+		"cannot be combined with content also read from stdin",
 		"snapifact compare before.txt after.txt",
 		"snapifact delete kpm2q6xxyegw5czekhga",
 		"snapifact <command> --help",
