@@ -116,6 +116,12 @@ func parseSnapshotArgs(flags *flag.FlagSet, args []string) ([]string, error) {
 			name = name[:equals]
 		}
 		registered := flags.Lookup(name)
+		if registered != nil && !isBoolFlag(registered.Value) && !strings.Contains(arg, "=") && i+1 == len(args) {
+			if err := flags.Parse(options); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("flag needs an argument: -%s", name)
+		}
 		if registered != nil && !isBoolFlag(registered.Value) && !strings.Contains(arg, "=") && i+1 < len(args) {
 			options = append(options, args[i+1])
 			i++

@@ -963,6 +963,7 @@ func TestParseSnapshotArgs(t *testing.T) {
 		{name: "separated bool value remains operand", args: []string{"--json", "false", "content.md"}, wantArgs: []string{"false", "content.md"}, wantJSON: true},
 		{name: "unknown option", args: []string{"content.md", "--unknown"}, wantErr: true},
 		{name: "missing string value", args: []string{"--title"}, wantErr: true},
+		{name: "missing string value after operand", args: []string{"content.md", "--title"}, wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			flags := flag.NewFlagSet("snapshot", flag.ContinueOnError)
@@ -1120,6 +1121,7 @@ func TestMalformedAndExtraArgsFailBeforeReadsAndSideEffects(t *testing.T) {
 	}{
 		{name: "upload unknown option", args: []string{"markdown", "--unknown"}},
 		{name: "upload extra operand", args: []string{"markdown", filepath.Join("missing", "content"), "extra"}},
+		{name: "upload missing value after operand", args: []string{"markdown", filepath.Join("missing", "content"), "--title"}},
 		{name: "compare unknown option", args: []string{"compare", "missing-before", "missing-after", "--unknown"}},
 		{name: "compare extra operand", args: []string{"compare", "missing-before", "missing-after", "extra"}},
 	} {
