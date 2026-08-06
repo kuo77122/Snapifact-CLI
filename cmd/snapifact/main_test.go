@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"mime"
 	"net/http"
@@ -902,6 +903,259 @@ func TestMarkdownFromPathDefaultOutput(t *testing.T) {
 	}
 	if stderr.Len() > 0 {
 		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+}
+
+func TestMarkdownPathThenOptionsCreatesTitledJSONSnapshot(t *testing.T) {
+	_, server, cleanup := testHarness(t)
+	defer cleanup()
+
+	contentPath := filepath.Join(t.TempDir(), "doc.md")
+	if err := os.WriteFile(contentPath, []byte("# Snapshot\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"markdown", contentPath, "-title", "My First Snapshot", "-json"}, nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	var response fileCreateOutput
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
+	}
+	if response.ID == "" || response.URL == "" || response.DeleteToken == "" {
+		t.Fatalf("incomplete JSON response: %+v", response)
+	}
+	if server.CreateCount() != 1 {
+		t.Fatalf("create count = %d, want 1", server.CreateCount())
+	}
+
+	var request struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal([]byte(server.LastCreateBody()), &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Title != "My First Snapshot" {
+		t.Fatalf("title = %q, want %q", request.Title, "My First Snapshot")
+	}
+}
+
+func TestParseSnapshotArgs(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		args      []string
+		wantArgs  []string
+		wantJSON  bool
+		wantTitle string
+		wantDesc  string
+		wantErr   bool
+	}{
+		{name: "options before", args: []string{"--json", "--title", "Snapshot", "content.md"}, wantArgs: []string{"content.md"}, wantJSON: true, wantTitle: "Snapshot"},
+		{name: "options after", args: []string{"content.md", "--json", "--title", "Snapshot"}, wantArgs: []string{"content.md"}, wantJSON: true, wantTitle: "Snapshot"},
+		{name: "options interspersed", args: []string{"--title", "Snapshot", "content.md", "--json"}, wantArgs: []string{"content.md"}, wantJSON: true, wantTitle: "Snapshot"},
+		{name: "single and double dash", args: []string{"-json", "--title=Snapshot", "content.md"}, wantArgs: []string{"content.md"}, wantJSON: true, wantTitle: "Snapshot"},
+		{name: "equals forms", args: []string{"-json=true", "--title=Snapshot", "content.md"}, wantArgs: []string{"content.md"}, wantJSON: true, wantTitle: "Snapshot"},
+		{name: "json false", args: []string{"content.md", "--json=false"}, wantArgs: []string{"content.md"}, wantTitle: ""},
+		{name: "dash-prefixed string value", args: []string{"-title", "-json", "content.md"}, wantArgs: []string{"content.md"}, wantTitle: "-json"},
+		{name: "dash-prefixed description value", args: []string{"content.md", "--description-file", "-description.md"}, wantArgs: []string{"content.md"}, wantDesc: "-description.md"},
+		{name: "terminator and dash-prefixed operand", args: []string{"--json", "--", "-content.md"}, wantArgs: []string{"-content.md"}, wantJSON: true},
+		{name: "separated bool value remains operand", args: []string{"--json", "false", "content.md"}, wantArgs: []string{"false", "content.md"}, wantJSON: true},
+		{name: "unknown option", args: []string{"content.md", "--unknown"}, wantErr: true},
+		{name: "missing string value", args: []string{"--title"}, wantErr: true},
+		{name: "missing string value after operand", args: []string{"content.md", "--title"}, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			flags := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+			flags.SetOutput(io.Discard)
+			jsonMode := flags.Bool("json", false, "output full JSON response")
+			title := flags.String("title", "", "snapshot title")
+			descFile := flags.String("description-file", "", "description path")
+
+			args, err := parseSnapshotArgs(flags, tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("parseSnapshotArgs unexpectedly succeeded")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSnapshotArgs error = %v", err)
+			}
+			if !equalStrings(args, tt.wantArgs) {
+				t.Fatalf("operands = %#v, want %#v", args, tt.wantArgs)
+			}
+			if *jsonMode != tt.wantJSON || *title != tt.wantTitle || *descFile != tt.wantDesc {
+				t.Fatalf("parsed flags = json:%v title:%q description:%q", *jsonMode, *title, *descFile)
+			}
+		})
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSharedUploadsAcceptTrailingAndInterspersedOptions(t *testing.T) {
+	for _, command := range []string{"diff", "file", "markdown", "mermaid", "html", "csv"} {
+		for _, ordering := range []string{"trailing", "interspersed"} {
+			t.Run(command+"/"+ordering, func(t *testing.T) {
+				_, server, cleanup := testHarness(t)
+				defer cleanup()
+
+				path := filepath.Join(t.TempDir(), "content")
+				if err := os.WriteFile(path, []byte("shared upload content"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				title := "Trailing"
+				args := []string{command, path, "--title", title, "--json"}
+				if ordering == "interspersed" {
+					title = "Interspersed"
+					args = []string{command, "--title", title, path, "--json"}
+				}
+
+				var stdout, stderr bytes.Buffer
+				if exitCode := run(args, nil, &stdout, &stderr); exitCode != 0 {
+					t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+				}
+				var response fileCreateOutput
+				if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+					t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
+				}
+				var request struct {
+					ContentType string `json:"content_type"`
+					Title       string `json:"title"`
+					Content     struct {
+						Text     string `json:"text"`
+						Filename string `json:"filename"`
+					} `json:"content"`
+				}
+				if err := json.Unmarshal([]byte(server.LastCreateBody()), &request); err != nil {
+					t.Fatal(err)
+				}
+				wantFilename := ""
+				if command == "csv" {
+					wantFilename = "content"
+				}
+				if request.ContentType != command || request.Title != title || request.Content.Text != "shared upload content" || request.Content.Filename != wantFilename || server.CreateCount() != 1 {
+					t.Fatalf("request = %+v, create count = %d", request, server.CreateCount())
+				}
+			})
+		}
+	}
+}
+
+func TestCompareAcceptsOptionsBetweenAndAfterOperands(t *testing.T) {
+	for _, ordering := range []string{"between", "after"} {
+		t.Run(ordering, func(t *testing.T) {
+			_, server, cleanup := testHarness(t)
+			defer cleanup()
+
+			root := t.TempDir()
+			beforePath := filepath.Join(root, "before.txt")
+			afterPath := filepath.Join(root, "after.txt")
+			if err := os.WriteFile(beforePath, []byte("before"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(afterPath, []byte("after"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			title := "Between"
+			args := []string{"compare", beforePath, "--title", title, afterPath, "--json"}
+			if ordering == "after" {
+				title = "After"
+				args = []string{"compare", beforePath, afterPath, "--title", title, "--json"}
+			}
+
+			var stdout, stderr bytes.Buffer
+			if exitCode := run(args, nil, &stdout, &stderr); exitCode != 0 {
+				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+			}
+			var response fileCreateOutput
+			if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+				t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
+			}
+			var request struct {
+				ContentType string `json:"content_type"`
+				Title       string `json:"title"`
+				Content     struct {
+					Before struct {
+						Text string `json:"text"`
+					} `json:"before"`
+					After struct {
+						Text string `json:"text"`
+					} `json:"after"`
+				} `json:"content"`
+			}
+			if err := json.Unmarshal([]byte(server.LastCreateBody()), &request); err != nil {
+				t.Fatal(err)
+			}
+			if request.ContentType != "compare" || request.Title != title || request.Content.Before.Text != "before" || request.Content.After.Text != "after" || server.CreateCount() != 1 {
+				t.Fatalf("request = %+v, create count = %d", request, server.CreateCount())
+			}
+		})
+	}
+}
+
+type failOnRead struct {
+	read bool
+}
+
+func (r *failOnRead) Read([]byte) (int, error) {
+	r.read = true
+	return 0, errors.New("stdin must not be read")
+}
+
+func TestMalformedAndExtraArgsFailBeforeReadsAndSideEffects(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{name: "upload unknown option", args: []string{"markdown", "--unknown"}},
+		{name: "upload extra operand", args: []string{"markdown", filepath.Join("missing", "content"), "extra"}},
+		{name: "upload missing value after operand", args: []string{"markdown", filepath.Join("missing", "content"), "--title"}},
+		{name: "compare unknown option", args: []string{"compare", "missing-before", "missing-after", "--unknown"}},
+		{name: "compare extra operand", args: []string{"compare", "missing-before", "missing-after", "extra"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, server, cleanup := testHarness(t)
+			defer cleanup()
+
+			stateDir := os.Getenv("SNAPIFACT_STATE_DIR")
+			tokenPath := filepath.Join(stateDir, "snapifact", "tokens", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+			if err := os.MkdirAll(filepath.Dir(tokenPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(tokenPath, []byte("stale-token"), 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			stdin := &failOnRead{}
+			var stdout, stderr bytes.Buffer
+			if exitCode := run(tt.args, stdin, &stdout, &stderr); exitCode == 0 {
+				t.Fatal("malformed arguments unexpectedly succeeded")
+			}
+			if stdin.read {
+				t.Fatal("stdin was read before argument validation")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			if server.CreateCount() != 0 {
+				t.Fatalf("create count = %d, want 0", server.CreateCount())
+			}
+			if content, err := os.ReadFile(tokenPath); err != nil || string(content) != "stale-token" {
+				t.Fatalf("stale token changed: content=%q err=%v", content, err)
+			}
+		})
 	}
 }
 

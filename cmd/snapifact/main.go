@@ -89,23 +89,75 @@ func cliVersion() string {
 	return "dev"
 }
 
+type boolFlag interface {
+	IsBoolFlag() bool
+}
+
+func parseSnapshotArgs(flags *flag.FlagSet, args []string) ([]string, error) {
+	options := make([]string, 0, len(args))
+	operands := make([]string, 0, len(args))
+	parsingOptions := true
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if parsingOptions && arg == "--" {
+			options = append(options, arg)
+			parsingOptions = false
+			continue
+		}
+		if !parsingOptions || len(arg) < 2 || arg[0] != '-' || arg == "-" {
+			operands = append(operands, arg)
+			continue
+		}
+
+		options = append(options, arg)
+		name := strings.TrimLeft(arg, "-")
+		if equals := strings.IndexByte(name, '='); equals >= 0 {
+			name = name[:equals]
+		}
+		registered := flags.Lookup(name)
+		if registered != nil && !isBoolFlag(registered.Value) && !strings.Contains(arg, "=") && i+1 == len(args) {
+			if err := flags.Parse(options); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("flag needs an argument: -%s", name)
+		}
+		if registered != nil && !isBoolFlag(registered.Value) && !strings.Contains(arg, "=") && i+1 < len(args) {
+			options = append(options, args[i+1])
+			i++
+		}
+	}
+
+	normalized := append(options, operands...)
+	if err := flags.Parse(normalized); err != nil {
+		return nil, err
+	}
+	return flags.Args(), nil
+}
+
+func isBoolFlag(value flag.Value) bool {
+	boolValue, ok := value.(boolFlag)
+	return ok && boolValue.IsBoolFlag()
+}
+
 func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("compare", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
-	if err := flags.Parse(args); err != nil {
+	operands, err := parseSnapshotArgs(flags, args)
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 1
 	}
-	if flags.NArg() != 2 {
+	if len(operands) != 2 {
 		fmt.Fprintln(stderr, "usage: snapifact compare [options] <before-file> <after-file>")
 		return 1
 	}
-	beforePath, afterPath := flags.Arg(0), flags.Arg(1)
+	beforePath, afterPath := operands[0], operands[1]
 	before, err := os.ReadFile(beforePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "read before file: %v\n", err)
@@ -139,16 +191,21 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
 
-	if err := flags.Parse(args); err != nil {
+	operands, err := parseSnapshotArgs(flags, args)
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 1
 	}
+	if len(operands) > 1 {
+		fmt.Fprintln(stderr, "usage: snapifact "+contentType+" [options] [path]")
+		return 1
+	}
 
 	// Detect ambiguous stdin BEFORE reading anything:
 	// content from stdin and description from stdin is ambiguous.
-	contentFromStdin := flags.NArg() == 0 || flags.Arg(0) == "-"
+	contentFromStdin := len(operands) == 0 || operands[0] == "-"
 	if contentFromStdin && *descFile == "-" {
 		fmt.Fprintf(stderr, "error: cannot read both content and description from stdin; provide a file path for one of them\n")
 		return 1
@@ -165,7 +222,7 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 		}
 		content = string(data)
 	default:
-		path := flags.Arg(0)
+		path := operands[0]
 		data, err := os.ReadFile(path)
 		if err != nil {
 			fmt.Fprintf(stderr, "read file: %v\n", err)
@@ -190,7 +247,7 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 	// Send to server
 	filename := ""
 	if contentType == "csv" && !contentFromStdin {
-		filename = filepath.Base(flags.Arg(0))
+		filename = filepath.Base(operands[0])
 	}
 	resp, err := cli.CreateSnapshotWithDescriptionAndFilename(serverURL, contentType, *title, content, filename, description)
 	if err != nil {
