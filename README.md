@@ -56,6 +56,11 @@ snapifact markdown README.md --title "README review"
 | `snapifact delete` | Delete a snapshot | Snapshot ID or URL |
 | `snapifact version` | Print the CLI version | — |
 
+Global flags are also available:
+
+- `snapifact --help` or `snapifact -h` prints the command list.
+- `snapifact --version` prints the CLI version.
+
 The upload and compare commands support these options:
 
 - `--title TEXT` sets a snapshot title.
