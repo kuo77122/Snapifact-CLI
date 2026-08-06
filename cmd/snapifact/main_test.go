@@ -1311,7 +1311,7 @@ func TestGlobalHelpContract(t *testing.T) {
 	}
 	got := stdout.String()
 	for _, fragment := range []string{
-		"Usage: snapifact <command> [options]",
+		"usage: snapifact <command> [options]",
 		"  diff       upload a unified diff snapshot",
 		"  compare    compare two UTF-8 files",
 		"stdin",

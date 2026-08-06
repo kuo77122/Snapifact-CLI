@@ -16,7 +16,7 @@ import (
 	"github.com/kuo77122/snapifact-cli/internal/cli"
 )
 
-const usageText = `Usage: snapifact <command> [options]
+const usageText = `usage: snapifact <command> [options]
 
 Commands:
   diff       upload a unified diff snapshot
@@ -123,7 +123,7 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, errorUsageText())
+		fmt.Fprint(stderr, usageText)
 		return 1
 	}
 
@@ -156,13 +156,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "version":
 		return runVersion(rest, stdout)
 	default:
-		fmt.Fprintf(stderr, "unknown command: %s\n\n%s", cmd, errorUsageText())
+		fmt.Fprintf(stderr, "unknown command: %s\n\n%s", cmd, usageText)
 		return 1
 	}
-}
-
-func errorUsageText() string {
-	return strings.Replace(usageText, "Usage:", "usage:", 1)
 }
 
 func cliVersion() string {
