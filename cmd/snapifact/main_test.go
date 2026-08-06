@@ -28,6 +28,7 @@ type contractTestServer struct {
 	*httptest.Server
 	mu             sync.Mutex
 	nextID         uint64
+	requestCount   atomic.Int32
 	lastCreateBody string
 	snapshots      map[string]string
 }
@@ -40,6 +41,7 @@ func newContractTestServer(t *testing.T) *contractTestServer {
 }
 
 func (s *contractTestServer) handle(w http.ResponseWriter, r *http.Request) {
+	s.requestCount.Add(1)
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/snapshots":
 		s.handleCreate(w, r)
@@ -141,6 +143,10 @@ func (s *contractTestServer) CreateCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return int(s.nextID)
+}
+
+func (s *contractTestServer) RequestCount() int {
+	return int(s.requestCount.Load())
 }
 
 func (s *contractTestServer) SeedSnapshot(t *testing.T) (id, token string) {
@@ -1298,13 +1304,64 @@ func TestDeleteWithoutArgsShowsUsage(t *testing.T) {
 	}
 }
 
-func TestGlobalHelpSucceeds(t *testing.T) {
+func TestDeleteWithExtraOperandFailsBeforeSideEffects(t *testing.T) {
+	_, server, cleanup := testHarness(t)
+	defer cleanup()
+
+	snapshotID, token := server.SeedSnapshot(t)
+	stateDir := os.Getenv("SNAPIFACT_STATE_DIR")
+	tokenDir := filepath.Join(stateDir, "snapifact", "tokens")
+	if err := os.MkdirAll(tokenDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(tokenDir, snapshotID)
+	if err := os.WriteFile(tokenPath, []byte(token), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"delete", snapshotID, "extra"}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("delete with extra operand unexpectedly succeeded")
+	}
+	if !strings.Contains(strings.ToLower(stderr.String()), "usage") {
+		t.Fatalf("stderr = %q, want usage error", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if server.RequestCount() != 0 {
+		t.Fatalf("HTTP request count = %d, want 0", server.RequestCount())
+	}
+	if content, err := os.ReadFile(tokenPath); err != nil || string(content) != token {
+		t.Fatalf("token changed: content=%q err=%v", content, err)
+	}
+}
+
+func TestGlobalHelpContract(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exitCode := run([]string{"--help"}, nil, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "usage: snapifact") {
-		t.Fatalf("stdout = %q, want global usage", stdout.String())
+	got := stdout.String()
+	for _, fragment := range []string{
+		"usage: snapifact <command> [options]",
+		"  diff       upload a unified diff snapshot",
+		"  compare    compare two UTF-8 files",
+		"stdin",
+		"Options may appear before or after operands",
+		"-- before a dash-prefixed path",
+		"--title <text>",
+		"--description-file <path|->",
+		"--json",
+		"--description-file - reads the description from stdin",
+		"cannot be combined with content also read from stdin",
+		"snapifact compare before.txt after.txt",
+		"snapifact delete kpm2q6xxyegw5czekhga",
+		"snapifact <command> --help",
+	} {
+		if !strings.Contains(got, fragment) {
+			t.Fatalf("global help = %q, missing %q", got, fragment)
+		}
 	}
 }
 
@@ -1331,17 +1388,133 @@ func TestCLIVersionUsesLinkerValue(t *testing.T) {
 	}
 }
 
-func TestEveryCommandHelpSucceeds(t *testing.T) {
-	for _, command := range []string{"diff", "compare", "file", "markdown", "mermaid", "html", "csv", "delete"} {
+func TestVersionCommandOutputIsExact(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"version"}, nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "snapifact dev" {
+		t.Fatalf("version output = %q, want %q", got, "snapifact dev")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected stderr = %q", stderr.String())
+	}
+}
+
+func TestVersionHelpContract(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"version", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	got := stdout.String() + stderr.String()
+	for _, fragment := range []string{
+		"Usage: snapifact version",
+		"Arguments: none",
+		"snapifact version --help",
+	} {
+		if !strings.Contains(got, fragment) {
+			t.Fatalf("version help = %q, missing %q", got, fragment)
+		}
+	}
+}
+
+func TestEveryCommandHelpContract(t *testing.T) {
+	sharedFragments := []string{
+		"[path]",
+		"Omit [path] or use - to read content from stdin",
+		"Options may appear before or after operands",
+		"-- before a dash-prefixed path",
+		"--title <text>",
+		"--description-file <path|->",
+		"--json",
+		"printf",
+		"--description-file -",
+	}
+	for _, command := range []string{"diff", "file", "markdown", "mermaid", "html", "csv"} {
 		t.Run(command, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if exitCode := run([]string{command, "--help"}, nil, &stdout, &stderr); exitCode != 0 {
 				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 			}
-			if !strings.Contains(strings.ToLower(stdout.String()+stderr.String()), "usage") {
-				t.Fatalf("help output = %q%q, want usage", stdout.String(), stderr.String())
+			got := stdout.String() + stderr.String()
+			for _, fragment := range append([]string{"Usage: snapifact " + command + " [options] [path]"}, sharedFragments...) {
+				if !strings.Contains(got, fragment) {
+					t.Fatalf("help output = %q, missing %q", got, fragment)
+				}
 			}
 		})
+	}
+
+	t.Run("compare", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if exitCode := run([]string{"compare", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+			t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+		}
+		got := stdout.String() + stderr.String()
+		for _, fragment := range []string{
+			"Usage: snapifact compare [options] <before-file> <after-file>",
+			"Exactly two UTF-8 file operands are required",
+			"The operand - is a file path, not a stdin shorthand",
+			"Options may appear before or after operands",
+			"-- before dash-prefixed paths",
+			"--title <text>",
+			"--description-file <path|->",
+			"--json",
+			"snapifact compare before.txt after.txt",
+		} {
+			if !strings.Contains(got, fragment) {
+				t.Fatalf("compare help = %q, missing %q", got, fragment)
+			}
+		}
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if exitCode := run([]string{"delete", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+			t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+		}
+		got := stdout.String() + stderr.String()
+		for _, fragment := range []string{
+			"Usage: snapifact delete <id-or-url>",
+			"Exactly one snapshot ID or URL is required",
+			"snapifact delete kpm2q6xxyegw5czekhga",
+			"snapifact delete https://view.test/v/kpm2q6xxyegw5czekhga",
+		} {
+			if !strings.Contains(got, fragment) {
+				t.Fatalf("delete help = %q, missing %q", got, fragment)
+			}
+		}
+	})
+}
+
+func TestHelpHasNoFileStdinTokenOrHTTPSideEffects(t *testing.T) {
+	server := newContractTestServer(t)
+	defer server.Close()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
+
+	commands := [][]string{{"--help"}, {"version", "--help"}, {"delete", "--help"}}
+	for _, command := range []string{"diff", "compare", "file", "markdown", "mermaid", "html", "csv"} {
+		commands = append(commands, []string{command, "missing-file", "--help"})
+	}
+	for _, args := range commands {
+		t.Run(strings.Join(args, "/"), func(t *testing.T) {
+			stdin := &failOnRead{}
+			var stdout, stderr bytes.Buffer
+			if exitCode := run(args, stdin, &stdout, &stderr); exitCode != 0 {
+				t.Fatalf("exit code = %d, stdout = %q, stderr = %q", exitCode, stdout.String(), stderr.String())
+			}
+			if stdin.read {
+				t.Fatal("help read stdin")
+			}
+			if server.RequestCount() != 0 {
+				t.Fatalf("help made %d HTTP requests", server.RequestCount())
+			}
+		})
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("help touched state directory: stat error = %v", err)
 	}
 }
 

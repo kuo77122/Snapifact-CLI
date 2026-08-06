@@ -18,9 +18,9 @@ import (
 
 const usageText = `usage: snapifact <command> [options]
 
-commands:
-	  diff       upload a unified diff snapshot
-	  compare    compare two UTF-8 files
+Commands:
+  diff       upload a unified diff snapshot
+  compare    compare two UTF-8 files
   file       upload a file snapshot
   markdown   upload a markdown snapshot
   mermaid    upload a Mermaid diagram snapshot
@@ -29,7 +29,95 @@ commands:
   delete     delete a snapshot
   version    print the CLI version
 
-run 'snapifact <command> --help' for per-command flags
+Rules:
+  Run 'snapifact <command> --help' for complete command syntax and examples.
+  For uploads, omit [path] or use - to read content from stdin.
+  Options may appear before or after operands for uploads and compare.
+  Use -- before a dash-prefixed path so it is treated as an operand.
+  compare requires exactly two UTF-8 file operands; delete requires one ID or URL.
+
+Options:
+  --version  print the CLI version and exit
+  --title <text>                 set the snapshot title
+  --description-file <path|->    read the markdown description from path; - reads it from stdin
+  --json                         output the full JSON response instead of only the snapshot URL
+
+  --description-file - reads the description from stdin and cannot be combined with content also read from stdin.
+
+Examples:
+  printf 'content\n' | snapifact markdown
+  snapifact file path/to/file.txt --title "Review" --json
+  snapifact compare before.txt after.txt
+  snapifact delete kpm2q6xxyegw5czekhga
+`
+
+const sharedOptionsText = `Options:
+  --title <text>                 set the snapshot title
+  --description-file <path|->    read the markdown description from path; - reads it from stdin
+  --json                         output the full JSON response instead of only the snapshot URL
+`
+
+const versionUsageText = `Usage: snapifact version
+
+Arguments: none
+
+Description:
+  Print the CLI version. Use --help to show this help without printing the version.
+
+Examples:
+  snapifact version
+  snapifact version --help
+`
+
+const deleteUsageText = `Usage: snapifact delete <id-or-url>
+
+Arguments:
+  <id-or-url>  exactly one snapshot ID or snapshot URL
+
+Rules:
+  Exactly one snapshot ID or URL is required.
+
+Examples:
+  snapifact delete kpm2q6xxyegw5czekhga
+  snapifact delete https://view.test/v/kpm2q6xxyegw5czekhga
+`
+
+func uploadUsageText(contentType string) string {
+	return fmt.Sprintf(`Usage: snapifact %s [options] [path]
+
+Arguments:
+  [path]  zero or one content file
+
+Rules:
+  Omit [path] or use - to read content from stdin.
+  Options may appear before or after operands.
+  Use -- before a dash-prefixed path.
+  --description-file - uses stdin for the description, so it is invalid when content also comes from stdin.
+
+%sExamples:
+  snapifact %s path/to/content --title "Review" --json
+  printf 'content\n' | snapifact %s
+  snapifact %s -- --content-file
+  snapifact %s --description-file - path/to/content
+  Invalid: printf 'content\n' | snapifact %s --description-file -
+`, contentType, sharedOptionsText, contentType, contentType, contentType, contentType, contentType)
+}
+
+const compareUsageText = `Usage: snapifact compare [options] <before-file> <after-file>
+
+Arguments:
+  <before-file> <after-file>  exactly two UTF-8 file operands
+
+Rules:
+  Exactly two UTF-8 file operands are required; compare does not read content from stdin.
+  The operand - is a file path, not a stdin shorthand.
+  Options may appear before or after operands.
+  Use -- before dash-prefixed paths.
+
+` + sharedOptionsText + `Examples:
+  snapifact compare before.txt after.txt
+  snapifact compare before.txt --title "Review" after.txt --json
+  snapifact compare -- -before.txt -after.txt
 `
 
 var version = "dev"
@@ -71,8 +159,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "delete":
 		return runDelete(rest, stdout, stderr)
 	case "version":
-		fmt.Fprintf(stdout, "snapifact %s\n", cliVersion())
-		return 0
+		return runVersion(rest, stdout)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n\n%s", cmd, usageText)
 		return 1
@@ -143,6 +230,7 @@ func isBoolFlag(value flag.Value) bool {
 func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("compare", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(flags.Output(), compareUsageText) }
 	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
@@ -187,6 +275,7 @@ func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 func runUpload(contentType string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(contentType, flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(flags.Output(), uploadUsageText(contentType)) }
 	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
@@ -322,13 +411,14 @@ func readDescription(descFile string, contentFromStdin bool, stdin io.Reader, st
 func runDelete(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("delete", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(flags.Output(), deleteUsageText) }
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 1
 	}
-	if flags.NArg() == 0 {
+	if flags.NArg() != 1 {
 		fmt.Fprintln(stderr, "usage: snapifact delete <id-or-url>")
 		return 1
 	}
@@ -363,6 +453,17 @@ func runDelete(args []string, stdout, stderr io.Writer) int {
 
 	// On success (204) or already gone (404), remove local token
 	_ = cli.RemoveToken(tokenDir, id)
+	return 0
+}
+
+func runVersion(args []string, stdout io.Writer) int {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			fmt.Fprint(stdout, versionUsageText)
+			return 0
+		}
+	}
+	fmt.Fprintf(stdout, "snapifact %s\n", cliVersion())
 	return 0
 }
 
