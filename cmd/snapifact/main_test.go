@@ -80,7 +80,7 @@ func (s *contractTestServer) handleCreate(w http.ResponseWriter, r *http.Request
 	var rawID [12]byte
 	binary.BigEndian.PutUint64(rawID[4:], s.nextID)
 	id := base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding).EncodeToString(rawID[:])
-	token := strings.Repeat("t", 43)
+	token := strings.Repeat("A", 43)
 	s.lastCreateBody = string(body)
 	s.snapshots[id] = token
 	s.mu.Unlock()
@@ -183,6 +183,7 @@ type fileCreateOutput struct {
 	URL         string `json:"url"`
 	ExpiresAt   string `json:"expires_at"`
 	DeleteToken string `json:"delete_token"`
+	Tier        string `json:"tier,omitempty"`
 }
 
 // errorOutput is the structured error from the server.
@@ -655,7 +656,7 @@ func TestDeleteServerErrorOutput(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
 	tokenDir := filepath.Join(stateDir, "snapifact", "tokens")
 	os.MkdirAll(tokenDir, 0700)
-	os.WriteFile(filepath.Join(tokenDir, fakeID), []byte("test-token"), 0600)
+	os.WriteFile(filepath.Join(tokenDir, fakeID), []byte(strings.Repeat("A", 43)), 0600)
 
 	var stdout, stderr bytes.Buffer
 	exitCode := run([]string{"delete", fakeID}, nil, &stdout, &stderr)
@@ -720,7 +721,7 @@ func TestStaleTokenCleanup(t *testing.T) {
 	}
 
 	oldPath := filepath.Join(tokenDir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	if err := os.WriteFile(oldPath, []byte("oldtoken"), 0600); err != nil {
+	if err := os.WriteFile(oldPath, []byte(strings.Repeat("A", 43)), 0600); err != nil {
 		t.Fatal(err)
 	}
 	oldTime := time.Now().Add(-8 * 24 * time.Hour)
@@ -729,7 +730,7 @@ func TestStaleTokenCleanup(t *testing.T) {
 	}
 
 	freshPath := filepath.Join(tokenDir, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-	if err := os.WriteFile(freshPath, []byte("freshtoken"), 0600); err != nil {
+	if err := os.WriteFile(freshPath, []byte(strings.Repeat("A", 42)+"Q"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -762,6 +763,239 @@ func TestTokenNotInNormalStdout(t *testing.T) {
 	}
 	if strings.Contains(out, "delete_token") {
 		t.Fatalf("default mode leaked delete_token: %s", out)
+	}
+}
+
+func TestKeyedDowngradeDeletesWithoutAPIKeyAndPrintsNoSuccess(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const id = "kpm2q6xxyegw5czekhga"
+	var createKey, deleteKey string
+	var deleteCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			createKey = r.Header.Get("X-Snapifact-API-Key")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"id":"`+id+`","url":"https://view.test/v/`+id+`","expires_at":"2026-08-13T00:00:00Z","delete_token":"`+token+`","tier":"anonymous"}`)
+		case http.MethodDelete:
+			deleteCount.Add(1)
+			deleteKey = r.Header.Get("X-Snapifact-API-Key")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("keyed downgrade unexpectedly succeeded")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if got := stderr.String(); got != "error: server did not apply the configured API key; snapshot was deleted\n" {
+		t.Fatalf("stderr = %q, want exact downgrade error", got)
+	}
+	if createKey != "configured-key" || deleteKey != "" || deleteCount.Load() != 1 {
+		t.Fatalf("create key = %q, delete key = %q, delete count = %d", createKey, deleteKey, deleteCount.Load())
+	}
+}
+
+func TestKeyedAcceptedTiersPreserveJSONResponse(t *testing.T) {
+	for _, tier := range []string{"basic", "pro", "admin"} {
+		t.Run(tier, func(t *testing.T) {
+			const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+			const id = "kpm2q6xxyegw5czekhga"
+			var createKey string
+			var deleteCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deleteCount.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				createKey = r.Header.Get("X-Snapifact-API-Key")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"id": id, "url": "https://view.test/v/" + id,
+					"expires_at": "2026-08-13T00:00:00Z", "delete_token": token, "tier": tier,
+				})
+			}))
+			defer server.Close()
+			t.Setenv("SNAPIFACT_SERVER", server.URL)
+			t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+			t.Setenv("SNAPIFACT_API_KEY", "configured-key")
+
+			var stdout, stderr bytes.Buffer
+			if exitCode := run([]string{"file", "--json"}, strings.NewReader("content"), &stdout, &stderr); exitCode != 0 {
+				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+			}
+			var output fileCreateOutput
+			if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+				t.Fatal(err)
+			}
+			if output.Tier != tier || createKey != "configured-key" || deleteCount.Load() != 0 {
+				t.Fatalf("tier=%q create key=%q delete count=%d", output.Tier, createKey, deleteCount.Load())
+			}
+			if strings.Contains(stdout.String()+stderr.String(), "configured-key") {
+				t.Fatal("API key appeared in CLI output")
+			}
+		})
+	}
+}
+
+func TestKeyedDowngradeTiersAreAllCompensated(t *testing.T) {
+	for _, tier := range []string{"", "anonymous", "unknown", "Basic", " basic "} {
+		t.Run(tier, func(t *testing.T) {
+			const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+			const id = "kpm2q6xxyegw5czekhga"
+			var deleteCount atomic.Int32
+			var deleteKey string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deleteCount.Add(1)
+					deleteKey = r.Header.Get("X-Snapifact-API-Key")
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"id": id, "url": "https://view.test/v/" + id,
+					"expires_at": "2026-08-13T00:00:00Z", "delete_token": token, "tier": tier,
+				})
+			}))
+			defer server.Close()
+			t.Setenv("SNAPIFACT_SERVER", server.URL)
+			t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+			t.Setenv("SNAPIFACT_API_KEY", "configured-key")
+
+			var stdout, stderr bytes.Buffer
+			if exitCode := run([]string{"file", "--json"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+				t.Fatal("downgrade unexpectedly succeeded")
+			}
+			if stdout.Len() != 0 || stderr.String() != "error: server did not apply the configured API key; snapshot was deleted\n" {
+				t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+			if deleteCount.Load() != 1 || deleteKey != "" || strings.Contains(stderr.String(), "configured-key") {
+				t.Fatalf("delete count=%d delete key=%q stderr=%q", deleteCount.Load(), deleteKey, stderr.String())
+			}
+		})
+	}
+}
+
+func TestKeyedDowngradeDeleteFailureSavesRecoveryToken(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const id = "kpm2q6xxyegw5czekhga"
+	var deleteKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleteKey = r.Header.Get("X-Snapifact-API-Key")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "delete_failed", "message": "try again", "request_id": "req"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"id": id, "url": "https://view.test/v/" + id,
+			"expires_at": "2026-08-13T00:00:00Z", "delete_token": token, "tier": "anonymous",
+		})
+	}))
+	defer server.Close()
+	stateDir := t.TempDir()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
+	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("downgrade unexpectedly succeeded")
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "Snapshot URL: https://view.test/v/"+id) || !strings.Contains(stderr.String(), "saved locally") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), token) || strings.Contains(stderr.String(), "configured-key") || deleteKey != "" {
+		t.Fatalf("secret or API key leaked: stderr=%q delete key=%q", stderr.String(), deleteKey)
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, "snapifact", "tokens", id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"version":1`) {
+		t.Fatalf("recovery token file = %q", data)
+	}
+}
+
+func TestKeyedDowngradeDeleteAndTokenSaveFailureIsLastResort(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const id = "kpm2q6xxyegw5czekhga"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "delete_failed", "message": "try again", "request_id": "req"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"id": id, "url": "https://view.test/v/" + id,
+			"expires_at": "not-an-expiry", "delete_token": token, "tier": "anonymous",
+		})
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("downgrade unexpectedly succeeded")
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "Snapshot delete token: "+token) || !strings.Contains(stderr.String(), "Save error:") || !strings.Contains(stderr.String(), "Delete error:") {
+		t.Fatalf("last-resort stderr=%q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "configured-key") {
+		t.Fatal("API key appeared in last-resort output")
+	}
+}
+
+func TestKeyedAcceptedTierWithMalformedExpiryUsesExistingCompensation(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const id = "kpm2q6xxyegw5czekhga"
+	var deleteCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleteCount.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"id": id, "url": "https://view.test/v/" + id,
+			"expires_at": "not-an-expiry", "delete_token": token, "tier": "basic",
+		})
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("malformed expiry unexpectedly succeeded")
+	}
+	if stdout.Len() != 0 || deleteCount.Load() != 1 || !strings.Contains(stderr.String(), "token save error") || strings.Contains(stderr.String(), "WARNING") {
+		t.Fatalf("stdout=%q stderr=%q delete count=%d", stdout.String(), stderr.String(), deleteCount.Load())
 	}
 }
 
@@ -832,7 +1066,7 @@ func TestTokenSaveFailureCompensatingDeleteFailsRecoveryWarning(t *testing.T) {
 			"id":           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"url":          "https://view.test/v/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"expires_at":   time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
-			"delete_token": "test-delete-token-for-recovery-warning-test-",
+			"delete_token": strings.Repeat("A", 43),
 		})
 	})
 	mux.HandleFunc("/v1/snapshots/", func(w http.ResponseWriter, r *http.Request) {

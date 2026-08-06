@@ -357,7 +357,30 @@ func writeCLIError(stderr io.Writer, err error) {
 }
 
 func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode bool, stdout, stderr io.Writer) int {
-	if err := cli.SaveToken(tokenDir, resp.ID, resp.DeleteToken); err != nil {
+	if os.Getenv("SNAPIFACT_API_KEY") != "" && !acceptedKeyedTier(resp.Tier) {
+		if err := cli.DeleteSnapshot(serverURL, resp.ID, resp.DeleteToken); err == nil {
+			fmt.Fprintln(stderr, "error: server did not apply the configured API key; snapshot was deleted")
+			return 1
+		} else {
+			deleteErr := err
+			if saveErr := cli.SaveToken(tokenDir, resp.ID, resp.DeleteToken, resp.ExpiresAt); saveErr == nil {
+				fmt.Fprintln(stderr, "WARNING: server did not apply the configured API key and compensating delete failed.")
+				fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
+				fmt.Fprintln(stderr, "Snapshot delete token saved locally.")
+				fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(deleteErr))
+				return 1
+			} else {
+				fmt.Fprintln(stderr, "WARNING: server did not apply the configured API key and also failed to revoke the snapshot.")
+				fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
+				fmt.Fprintf(stderr, "Snapshot delete token: %s\n", resp.DeleteToken)
+				fmt.Fprintf(stderr, "Save error: %v\n", saveErr)
+				fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(deleteErr))
+				return 1
+			}
+		}
+	}
+
+	if err := cli.SaveToken(tokenDir, resp.ID, resp.DeleteToken, resp.ExpiresAt); err != nil {
 		// Token-save failure: attempt compensating delete
 		if delErr := cli.DeleteSnapshot(serverURL, resp.ID, resp.DeleteToken); delErr != nil {
 			// Compensating delete also failed — print recovery warning
@@ -365,7 +388,7 @@ func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode
 			fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
 			fmt.Fprintf(stderr, "Snapshot delete token: %s\n", resp.DeleteToken)
 			fmt.Fprintf(stderr, "Save error: %v\n", err)
-			fmt.Fprintf(stderr, "Delete error: %v\n", delErr)
+			fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(delErr))
 		} else {
 			// Compensating delete succeeded — no URL, non-zero exit
 			fmt.Fprintf(stderr, "error: snapshot created but failed to save delete token locally; snapshot was revoked on the server.\n")
@@ -382,6 +405,22 @@ func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode
 		fmt.Fprintln(stdout, resp.URL)
 	}
 	return 0
+}
+
+func acceptedKeyedTier(tier string) bool {
+	switch tier {
+	case "basic", "pro", "admin":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeError(err error) string {
+	if apiKey := os.Getenv("SNAPIFACT_API_KEY"); apiKey != "" {
+		return strings.ReplaceAll(err.Error(), apiKey, "[REDACTED]")
+	}
+	return err.Error()
 }
 
 // readDescription reads the description from the --description-file path.
