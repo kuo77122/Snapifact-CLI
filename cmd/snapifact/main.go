@@ -350,9 +350,9 @@ func writeCLIError(stderr io.Writer, err error) {
 	var errResp *cli.ErrorResponse
 	if errors.As(err, &errResp) {
 		out, _ := json.Marshal(errResp)
-		fmt.Fprintln(stderr, string(out))
+		fmt.Fprintln(stderr, sanitizeText(string(out)))
 	} else {
-		fmt.Fprintf(stderr, "error: %v\n", err)
+		fmt.Fprintf(stderr, "error: %s\n", sanitizeError(err))
 	}
 }
 
@@ -367,7 +367,7 @@ func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode
 				fmt.Fprintln(stderr, "WARNING: server did not apply the configured API key and compensating delete failed.")
 				fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
 				fmt.Fprintln(stderr, "Snapshot delete token saved locally.")
-				fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(deleteErr))
+				fmt.Fprintf(stderr, "Delete error: %s\n", sanitizeError(deleteErr, resp.DeleteToken))
 				return 1
 			} else {
 				fmt.Fprintln(stderr, "WARNING: server did not apply the configured API key and also failed to revoke the snapshot.")
@@ -416,11 +416,24 @@ func acceptedKeyedTier(tier string) bool {
 	}
 }
 
-func sanitizeError(err error) string {
+func sanitizeError(err error, extra ...string) string {
+	return sanitizeTextWithSecrets(err.Error(), extra...)
+}
+
+func sanitizeText(text string) string {
+	return sanitizeTextWithSecrets(text)
+}
+
+func sanitizeTextWithSecrets(text string, extra ...string) string {
 	if apiKey := os.Getenv("SNAPIFACT_API_KEY"); apiKey != "" {
-		return strings.ReplaceAll(err.Error(), apiKey, "[REDACTED]")
+		text = strings.ReplaceAll(text, apiKey, "[REDACTED]")
 	}
-	return err.Error()
+	for _, secret := range extra {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "[REDACTED]")
+		}
+	}
+	return text
 }
 
 // readDescription reads the description from the --description-file path.

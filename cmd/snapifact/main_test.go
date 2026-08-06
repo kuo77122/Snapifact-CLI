@@ -552,6 +552,29 @@ func TestFileServerErrorOutput(t *testing.T) {
 	}
 }
 
+func TestCreateErrorRedactsConfiguredAPIKey(t *testing.T) {
+	const apiKey = "configured-key"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code": "invalid_request", "message": "echoed " + apiKey, "request_id": "req",
+		})
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+	t.Setenv("SNAPIFACT_API_KEY", apiKey)
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("server error unexpectedly succeeded")
+	}
+	if stdout.Len() != 0 || strings.Contains(stderr.String(), apiKey) {
+		t.Fatalf("API key leaked in create error: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 func TestDeleteByID(t *testing.T) {
 	_, server, cleanup := testHarness(t)
 	defer cleanup()
@@ -899,7 +922,7 @@ func TestKeyedDowngradeDeleteFailureSavesRecoveryToken(t *testing.T) {
 			deleteKey = r.Header.Get("X-Snapifact-API-Key")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"code": "delete_failed", "message": "try again", "request_id": "req"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"code": "delete_failed", "message": "try again " + token, "request_id": "req"})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
