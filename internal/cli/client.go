@@ -27,6 +27,7 @@ type CreateResponse struct {
 	URL         string `json:"url"`
 	ExpiresAt   string `json:"expires_at"`
 	DeleteToken string `json:"delete_token"`
+	Tier        string `json:"tier,omitempty"`
 }
 
 // ErrorResponse is the JSON error body returned by the server.
@@ -146,6 +147,9 @@ func createSnapshotRequest(serverURL string, body io.Reader) (*CreateResponse, e
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if apiKey := os.Getenv("SNAPIFACT_API_KEY"); apiKey != "" {
+		req.Header.Set("X-Snapifact-API-Key", apiKey)
+	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
