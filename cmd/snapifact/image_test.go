@@ -161,8 +161,7 @@ func TestImageRejectsInvalidAndOversizedInputBeforeHTTP(t *testing.T) {
 		args  []string
 		stdin string
 	}{
-		"invalid path":    {args: []string{"image", filepath.Join(t.TempDir(), "not-image")}},
-		"invalid stdin":   {args: []string{"image"}, stdin: "plain text"},
+		"unreadable path": {args: []string{"image", filepath.Join(t.TempDir(), "not-image")}},
 		"oversized path":  {args: []string{"image", oversizedPath}},
 		"oversized stdin": {args: []string{"image"}, stdin: string(oversized)},
 	} {
@@ -179,6 +178,39 @@ func TestImageRejectsInvalidAndOversizedInputBeforeHTTP(t *testing.T) {
 				t.Fatalf("stdout=%q request count=%d", stdout.String(), got.requestNum.Load())
 			}
 		})
+	}
+}
+
+func TestImageInvalidBytesReachServerAndPreserveStructuredError(t *testing.T) {
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/snapshots/binary" {
+			t.Fatalf("request = %s %s, want POST /v1/snapshots/binary", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code": "invalid_image", "message": "server rejected image", "request_id": "image-request-id",
+		})
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"image"}, strings.NewReader("not a PNG or JPEG"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("server image error unexpectedly succeeded")
+	}
+	var output errorOutput
+	if err := json.Unmarshal(stderr.Bytes(), &output); err != nil {
+		t.Fatalf("stderr JSON = %q: %v", stderr.String(), err)
+	}
+	if output.Code != "invalid_image" || output.Message != "server rejected image" || output.RequestID != "image-request-id" {
+		t.Fatalf("structured error = %+v", output)
+	}
+	if stdout.Len() != 0 || requestCount.Load() != 1 {
+		t.Fatalf("stdout=%q request count=%d, want one request and no output", stdout.String(), requestCount.Load())
 	}
 }
 

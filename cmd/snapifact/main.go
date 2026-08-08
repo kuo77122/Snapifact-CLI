@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -43,7 +42,7 @@ Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
   --json                         output the full JSON response instead of only the snapshot URL
-  SNAPIFACT_API_KEY              optional create API key; never sent on delete or view
+  SNAPIFACT_API_KEY              optional API key for create requests; never sent on delete, view, or raw
 
   --description-file - reads the description from stdin and cannot be combined with content also read from stdin.
 
@@ -116,7 +115,7 @@ Rules:
   Options may appear before or after the operand.
   Use -- before a dash-prefixed path.
   Image content is limited to 8 MiB.
-  SNAPIFACT_API_KEY is optional and applies only to image creation.
+  SNAPIFACT_API_KEY is optional and applies to create requests, including image creation; never sent on delete, view, or raw.
   --description-file - uses stdin for the description, so it is invalid when content also comes from stdin.
 
 ` + sharedOptionsText + `Examples:
@@ -400,11 +399,6 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "read image: %v\n", err)
 		return 1
 	}
-	if !isPNGOrJPEG(content) {
-		fmt.Fprintln(stderr, "read image: input is not a PNG or JPEG")
-		return 1
-	}
-
 	description, err := readDescription(*descFile, contentFromStdin, stdin, stderr)
 	if err != nil {
 		return 1
@@ -445,11 +439,6 @@ func readImageContent(operands []string, contentFromStdin bool, stdin io.Reader)
 		return nil, fmt.Errorf("content exceeds 8 MiB limit")
 	}
 	return content, nil
-}
-
-func isPNGOrJPEG(content []byte) bool {
-	return bytes.HasPrefix(content, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) ||
-		bytes.HasPrefix(content, []byte{0xff, 0xd8, 0xff})
 }
 
 func writeCLIError(stderr io.Writer, err error) {

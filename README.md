@@ -69,15 +69,16 @@ The upload and compare commands support these options:
   the description from stdin when the artifact itself comes from a file.
 - `--json` prints the complete create response instead of only the review URL.
 
-For image uploads, set `SNAPIFACT_API_KEY` to apply a basic, pro, or admin API
-key to the create request:
+For image uploads, set the optional `SNAPIFACT_API_KEY` environment variable to
+apply a basic, pro, or admin API key to create requests, including image
+creation:
 
 ```sh
 SNAPIFACT_API_KEY="$SNAPIFACT_API_KEY" snapifact image photo.png
 ```
 
-The key is used only for creation, never sent on delete, view, or other
-requests. Image input must be PNG or JPEG and is limited to 8 MiB.
+The key is never sent on delete, view, or raw requests. Image input is limited
+to 8 MiB; the server remains authoritative for image validation.
 
 Content can be read from stdin with `-` or by omitting the path:
 

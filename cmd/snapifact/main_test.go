@@ -1714,7 +1714,7 @@ func TestEveryCommandHelpContract(t *testing.T) {
 			"zero or one PNG or JPEG file",
 			"Omit [path] or use - to read a PNG or JPEG from stdin",
 			"Image content is limited to 8 MiB",
-			"SNAPIFACT_API_KEY",
+			"SNAPIFACT_API_KEY is optional and applies to create requests, including image creation; never sent on delete, view, or raw",
 		} {
 			if !strings.Contains(got, fragment) {
 				t.Fatalf("image help = %q, missing %q", got, fragment)
