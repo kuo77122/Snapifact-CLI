@@ -106,7 +106,7 @@ Rules:
 `, contentType, sharedOptionsText, contentType, contentType, contentType, contentType, contentType)
 }
 
-const imageUsageText = `Usage: snapifact image [options] [path]
+const imageUsageText = `Usage: snapifact image [options] [path|-]
 
 Arguments:
   [path]  zero or one PNG or JPEG file
@@ -385,7 +385,7 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if len(operands) > 1 {
-		fmt.Fprintln(stderr, "usage: snapifact image [options] [path]")
+		fmt.Fprintln(stderr, "usage: snapifact image [options] [path|-]")
 		return 1
 	}
 

@@ -1710,7 +1710,7 @@ func TestEveryCommandHelpContract(t *testing.T) {
 		}
 		got := stdout.String() + stderr.String()
 		for _, fragment := range []string{
-			"Usage: snapifact image [options] [path]",
+			"Usage: snapifact image [options] [path|-]",
 			"zero or one PNG or JPEG file",
 			"Omit [path] or use - to read a PNG or JPEG from stdin",
 			"Image content is limited to 8 MiB",
