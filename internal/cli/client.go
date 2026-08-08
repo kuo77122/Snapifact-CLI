@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
 	"strings"
 	"time"
@@ -38,6 +41,11 @@ type ErrorResponse struct {
 }
 
 var errNoToken = errors.New("delete token not found")
+
+// MaxImageContentSize is the fixed backend limit for image content.
+const MaxImageContentSize = 8 << 20
+
+const maxImageContentSize = MaxImageContentSize
 
 // CreateSnapshot sends a file content to the server and returns the response.
 // It does NOT retry on timeout — the caller handles that.
@@ -147,9 +155,7 @@ func createSnapshotRequest(serverURL string, body io.Reader) (*CreateResponse, e
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if apiKey := os.Getenv("SNAPIFACT_API_KEY"); apiKey != "" {
-		req.Header.Set("X-Snapifact-API-Key", apiKey)
-	}
+	applyCreateHeaders(req)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -163,7 +169,84 @@ func createSnapshotRequest(serverURL string, body io.Reader) (*CreateResponse, e
 		return nil, fmt.Errorf("read create response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusCreated {
+	return parseCreateResponse(resp.StatusCode, raw)
+}
+
+// CreateBinarySnapshot sends an image as the backend's two-part multipart request.
+// It does NOT retry on timeout — the caller handles that.
+func CreateBinarySnapshot(serverURL, title string, content []byte, filename, description string) (*CreateResponse, error) {
+	if len(content) > maxImageContentSize {
+		return nil, fmt.Errorf("image content exceeds 8 MiB limit")
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	metadataHeader := make(textproto.MIMEHeader)
+	metadataHeader.Set("Content-Disposition", `form-data; name="metadata"`)
+	metadataHeader.Set("Content-Type", "application/json")
+	metadata, err := writer.CreatePart(metadataHeader)
+	if err != nil {
+		return nil, fmt.Errorf("create metadata part: %w", err)
+	}
+	metadataBody := map[string]string{"content_type": "image"}
+	if title != "" {
+		metadataBody["title"] = title
+	}
+	if description != "" {
+		metadataBody["description_markdown"] = description
+	}
+	if filename != "" {
+		metadataBody["filename"] = filename
+	}
+	if err := json.NewEncoder(metadata).Encode(metadataBody); err != nil {
+		return nil, fmt.Errorf("encode image metadata: %w", err)
+	}
+
+	contentHeader := make(textproto.MIMEHeader)
+	dispositionParams := map[string]string{"name": "content"}
+	if filename != "" {
+		dispositionParams["filename"] = filename
+	}
+	contentHeader.Set("Content-Disposition", mime.FormatMediaType("form-data", dispositionParams))
+	contentHeader.Set("Content-Type", "application/octet-stream")
+	contentPart, err := writer.CreatePart(contentHeader)
+	if err != nil {
+		return nil, fmt.Errorf("create content part: %w", err)
+	}
+	if _, err := contentPart.Write(content); err != nil {
+		return nil, fmt.Errorf("write image content: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("close multipart request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/v1/snapshots/binary", &body)
+	if err != nil {
+		return nil, fmt.Errorf("create binary request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	applyCreateHeaders(req)
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("create binary snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read create response: %w", err)
+	}
+	return parseCreateResponse(resp.StatusCode, raw)
+}
+
+func applyCreateHeaders(req *http.Request) {
+	if apiKey := os.Getenv("SNAPIFACT_API_KEY"); apiKey != "" {
+		req.Header.Set("X-Snapifact-API-Key", apiKey)
+	}
+}
+
+func parseCreateResponse(status int, raw []byte) (*CreateResponse, error) {
+	if status != http.StatusCreated {
 		return nil, parseError(raw)
 	}
 

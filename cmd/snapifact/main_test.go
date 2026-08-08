@@ -1604,6 +1604,7 @@ func TestGlobalHelpContract(t *testing.T) {
 		"usage: snapifact <command> [options]",
 		"  diff       upload a unified diff snapshot",
 		"  compare    compare two UTF-8 files",
+		"  image      upload a PNG or JPEG image snapshot",
 		"stdin",
 		"Options may appear before or after operands",
 		"-- before a dash-prefixed path",
@@ -1702,6 +1703,25 @@ func TestEveryCommandHelpContract(t *testing.T) {
 		})
 	}
 
+	t.Run("image", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if exitCode := run([]string{"image", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+			t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+		}
+		got := stdout.String() + stderr.String()
+		for _, fragment := range []string{
+			"Usage: snapifact image [options] [path]",
+			"zero or one PNG or JPEG file",
+			"Omit [path] or use - to read a PNG or JPEG from stdin",
+			"Image content is limited to 8 MiB",
+			"SNAPIFACT_API_KEY",
+		} {
+			if !strings.Contains(got, fragment) {
+				t.Fatalf("image help = %q, missing %q", got, fragment)
+			}
+		}
+	})
+
 	t.Run("compare", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		if exitCode := run([]string{"compare", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
@@ -1752,7 +1772,7 @@ func TestHelpHasNoFileStdinTokenOrHTTPSideEffects(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
 
 	commands := [][]string{{"--help"}, {"version", "--help"}, {"delete", "--help"}}
-	for _, command := range []string{"diff", "compare", "file", "markdown", "mermaid", "html", "csv"} {
+	for _, command := range []string{"diff", "compare", "file", "markdown", "mermaid", "html", "csv", "image"} {
 		commands = append(commands, []string{command, "missing-file", "--help"})
 	}
 	for _, args := range commands {
