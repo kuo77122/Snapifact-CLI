@@ -53,6 +53,7 @@ snapifact markdown README.md --title "README review"
 | `snapifact mermaid` | Upload a Mermaid diagram snapshot | One file or stdin |
 | `snapifact html` | Upload a sandboxed HTML snapshot | One file or stdin |
 | `snapifact csv` | Upload a CSV snapshot | One file or stdin |
+| `snapifact image` | Upload a PNG or JPEG image snapshot | One file or stdin (8 MiB maximum) |
 | `snapifact delete` | Delete a snapshot | Snapshot ID or URL |
 | `snapifact version` | Print the CLI version | — |
 
@@ -68,10 +69,22 @@ The upload and compare commands support these options:
   the description from stdin when the artifact itself comes from a file.
 - `--json` prints the complete create response instead of only the review URL.
 
+For image uploads, set the optional `SNAPIFACT_API_KEY` environment variable to
+apply a basic, pro, or admin API key to create requests, including image
+creation:
+
+```sh
+SNAPIFACT_API_KEY="$SNAPIFACT_API_KEY" snapifact image photo.png
+```
+
+The key is never sent on delete, view, or raw requests. Image input is limited
+to 8 MiB; the server remains authoritative for image validation.
+
 Content can be read from stdin with `-` or by omitting the path:
 
 ```sh
 cat report.md | snapifact markdown -
+cat photo.jpg | snapifact image
 snapifact compare before.txt after.txt --title "Before and after"
 snapifact markdown report.md --description-file notes.md
 snapifact delete https://snapifact.dev/v/<snapshot-id>

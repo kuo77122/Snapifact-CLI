@@ -26,6 +26,7 @@ Commands:
   mermaid    upload a Mermaid diagram snapshot
   html       upload a sandboxed HTML snapshot
   csv        upload a CSV snapshot
+  image      upload a PNG or JPEG image snapshot
   delete     delete a snapshot
   version    print the CLI version
 
@@ -41,6 +42,7 @@ Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
   --json                         output the full JSON response instead of only the snapshot URL
+  SNAPIFACT_API_KEY              optional API key for create requests; never sent on delete, view, or raw
 
   --description-file - reads the description from stdin and cannot be combined with content also read from stdin.
 
@@ -103,6 +105,24 @@ Rules:
 `, contentType, sharedOptionsText, contentType, contentType, contentType, contentType, contentType)
 }
 
+const imageUsageText = `Usage: snapifact image [options] [path|-]
+
+Arguments:
+  [path]  zero or one PNG or JPEG file
+
+Rules:
+  Omit [path] or use - to read a PNG or JPEG from stdin.
+  Options may appear before or after the operand.
+  Use -- before a dash-prefixed path.
+  Image content is limited to 8 MiB.
+  SNAPIFACT_API_KEY is optional and applies to create requests, including image creation; never sent on delete, view, or raw.
+  --description-file - uses stdin for the description, so it is invalid when content also comes from stdin.
+
+` + sharedOptionsText + `Examples:
+  snapifact image path/to/photo.png --title "Review" --json
+  cat photo.jpg | snapifact image
+`
+
 const compareUsageText = `Usage: snapifact compare [options] <before-file> <after-file>
 
 Arguments:
@@ -156,6 +176,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runUpload("html", rest, stdin, stdout, stderr)
 	case "csv":
 		return runUpload("csv", rest, stdin, stdout, stderr)
+	case "image":
+		return runImage(rest, stdin, stdout, stderr)
 	case "delete":
 		return runDelete(rest, stdout, stderr)
 	case "version":
@@ -344,6 +366,79 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 		return 1
 	}
 	return finishCreate(serverURL, tokenDir, resp, *jsonMode, stdout, stderr)
+}
+
+func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("image", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(flags.Output(), imageUsageText) }
+	jsonMode := flags.Bool("json", false, "output full JSON response")
+	title := flags.String("title", "", "snapshot title")
+	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
+
+	operands, err := parseSnapshotArgs(flags, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	if len(operands) > 1 {
+		fmt.Fprintln(stderr, "usage: snapifact image [options] [path|-]")
+		return 1
+	}
+
+	contentFromStdin := len(operands) == 0 || operands[0] == "-"
+	if contentFromStdin && *descFile == "-" {
+		fmt.Fprintln(stderr, "error: cannot read both content and description from stdin; provide a file path for one of them")
+		return 1
+	}
+
+	content, err := readImageContent(operands, contentFromStdin, stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "read image: %v\n", err)
+		return 1
+	}
+	description, err := readDescription(*descFile, contentFromStdin, stdin, stderr)
+	if err != nil {
+		return 1
+	}
+
+	serverURL := cli.ServerURL()
+	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
+	cli.CleanStaleTokens(tokenDir)
+	filename := ""
+	if !contentFromStdin {
+		filename = filepath.Base(operands[0])
+	}
+	response, err := cli.CreateBinarySnapshot(serverURL, *title, content, filename, description)
+	if err != nil {
+		writeCLIError(stderr, err)
+		return 1
+	}
+	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr)
+}
+
+func readImageContent(operands []string, contentFromStdin bool, stdin io.Reader) ([]byte, error) {
+	var reader io.Reader = stdin
+	var file *os.File
+	if !contentFromStdin {
+		var err error
+		file, err = os.Open(operands[0])
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		reader = file
+	}
+	content, err := io.ReadAll(io.LimitReader(reader, cli.MaxImageContentSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > cli.MaxImageContentSize {
+		return nil, fmt.Errorf("content exceeds 8 MiB limit")
+	}
+	return content, nil
 }
 
 func writeCLIError(stderr io.Writer, err error) {
