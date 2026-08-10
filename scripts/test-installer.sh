@@ -94,7 +94,7 @@ if output=$(run_install "$TMP/bad-tampered" "$TMP/safe" 2>&1); then fail 'tamper
 ! compgen -G "$TMP/downloads/snapifact-install.*" >/dev/null || fail 'private temporary files were left behind'
 
 for command in --help -h version; do output=$(HOME="$TMP/home" "$TMP/generated-install/snapifact" "$command"); case "$command" in version) [[ "$output" == 'snapifact v1.2.3' ]] || fail "version output: $output" ;; *) assert_contains "$output" 'usage: snapifact' ;; esac; done
-for command in diff compare file markdown mermaid html csv delete; do "$TMP/generated-install/snapifact" "$command" --help >/dev/null 2>&1 || fail "$command help failed"; done
+for command in diff compare text markdown mermaid html csv delete; do "$TMP/generated-install/snapifact" "$command" --help >/dev/null 2>&1 || fail "$command help failed"; done
 
 cat >"$TMP/server.go" <<'EOF'
 package main
@@ -106,7 +106,7 @@ EOF
 for _ in $(seq 1 50); do [ -s "$TMP/port" ] && break; sleep .1; done
 [ -s "$TMP/port" ] || fail 'local HTTP handler did not start'
 port=$(<"$TMP/port"); printf content >"$TMP/input.txt"; state="$TMP/state"
-url=$(SNAPIFACT_SERVER="http://127.0.0.1:$port" SNAPIFACT_STATE_DIR="$state" "$TMP/generated-install/snapifact" file "$TMP/input.txt")
+url=$(SNAPIFACT_SERVER="http://127.0.0.1:$port" SNAPIFACT_STATE_DIR="$state" "$TMP/generated-install/snapifact" text "$TMP/input.txt")
 [[ "$url" == http://127.0.0.1:$port/v/kpm2q6xxyegw5czekhga ]] || fail "unexpected create URL: $url"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' "$url")" == 200 ]] || fail 'view did not return 200'
 SNAPIFACT_SERVER="http://127.0.0.1:$port" SNAPIFACT_STATE_DIR="$state" "$TMP/generated-install/snapifact" delete "$url"

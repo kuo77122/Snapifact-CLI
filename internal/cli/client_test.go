@@ -22,8 +22,14 @@ func TestServerURLDefaultsToOfficialEndpoint(t *testing.T) {
 func TestCreateSnapshotUsesVerbatimAPIKeyAndParsesTier(t *testing.T) {
 	const apiKey = "key with spaces"
 	var gotKey string
+	var gotBody struct {
+		ContentType string `json:"content_type"`
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotKey = r.Header.Get("X-Snapifact-API-Key")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatal(err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -43,6 +49,9 @@ func TestCreateSnapshotUsesVerbatimAPIKeyAndParsesTier(t *testing.T) {
 	}
 	if gotKey != apiKey {
 		t.Fatalf("API key header = %q, want %q", gotKey, apiKey)
+	}
+	if gotBody.ContentType != "text" {
+		t.Fatalf("content_type = %q, want text", gotBody.ContentType)
 	}
 	if response.Tier != "basic" {
 		t.Fatalf("tier = %q, want basic", response.Tier)

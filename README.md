@@ -48,7 +48,7 @@ snapifact markdown README.md --title "README review"
 | --- | --- | --- |
 | `snapifact diff` | Upload a unified diff snapshot | One file or stdin |
 | `snapifact compare` | Compare two UTF-8 files | Two file paths |
-| `snapifact file` | Upload a file snapshot | One file or stdin |
+| `snapifact text` | Upload UTF-8 plain text or source code | One file or stdin |
 | `snapifact markdown` | Upload a Markdown snapshot | One file or stdin |
 | `snapifact mermaid` | Upload a Mermaid diagram snapshot | One file or stdin |
 | `snapifact html` | Upload a sandboxed HTML snapshot | One file or stdin |
@@ -106,7 +106,7 @@ Options may appear before, after, or between path operands. Use `--` before a
 path that starts with `-`:
 
 ```sh
-snapifact file -- -report.txt
+snapifact text -- -report.txt
 ```
 
 Run `snapifact <command> --help` for the command's built-in usage text.
