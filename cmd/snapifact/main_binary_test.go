@@ -43,7 +43,7 @@ func TestCompiledCLIUsesCreateAPIKeyHeader(t *testing.T) {
 		t.Fatalf("compiled CLI build failed: %v", err)
 	}
 
-	cmd := exec.Command(binary, "file")
+	cmd := exec.Command(binary, "text")
 	cmd.Dir = root
 	cmd.Stdin = strings.NewReader("compiled content")
 	cmd.Env = append(os.Environ(),

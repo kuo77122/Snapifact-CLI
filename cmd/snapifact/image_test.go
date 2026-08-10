@@ -142,7 +142,7 @@ func TestImageOptionsCanFollowPathAndProduceJSON(t *testing.T) {
 	if exitCode := run(args, nil, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var output fileCreateOutput
+	var output createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
 		t.Fatalf("stdout JSON = %q: %v", stdout.String(), err)
 	}
