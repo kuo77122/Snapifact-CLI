@@ -68,6 +68,10 @@ The upload and compare commands support these options:
 - `--description-file PATH` reads a Markdown description file. Use `-` to read
   the description from stdin when the artifact itself comes from a file.
 - `--json` prints the complete create response instead of only the review URL.
+- `--password` securely prompts for a password and confirmation from the
+  controlling terminal. It requires `SNAPIFACT_API_KEY`; the password is never
+  read from stdin, argv, environment, or a file. Passwords must be valid UTF-8
+  and 12–1024 bytes.
 
 For image uploads, set the optional `SNAPIFACT_API_KEY` environment variable to
 apply a basic, pro, or admin API key to create requests, including image
@@ -75,6 +79,14 @@ creation:
 
 ```sh
 SNAPIFACT_API_KEY="$SNAPIFACT_API_KEY" snapifact image photo.png
+```
+
+To create a password-protected snapshot, add `--password` to any create or
+compare command. The API key is required and the CLI prompts twice without
+echoing the password:
+
+```sh
+SNAPIFACT_API_KEY="$SNAPIFACT_API_KEY" snapifact markdown README.md --password
 ```
 
 The key is never sent on delete, view, or raw requests. Image input is limited

@@ -133,6 +133,18 @@ func writeContractError(w http.ResponseWriter, status int, code, message, reques
 	_ = json.NewEncoder(w).Encode(map[string]string{"code": code, "message": message, "request_id": requestID})
 }
 
+func writeCreateResponseWithTierAndURL(w http.ResponseWriter, tier, url string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"id":           "kpm2q6xxyegw5czekhga",
+		"url":          url,
+		"expires_at":   time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		"delete_token": strings.Repeat("A", 43),
+		"tier":         tier,
+	})
+}
+
 func (s *contractTestServer) LastCreateBody() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,6 +230,187 @@ func TestTextFromPathDefaultOutput(t *testing.T) {
 	}
 	if stderr.Len() > 0 {
 		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+}
+
+func TestCreateHelpIncludesPasswordFlag(t *testing.T) {
+	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "image"} {
+		t.Run(command, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if exitCode := run([]string{command, "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+			}
+			if !strings.Contains(stdout.String()+stderr.String(), "--password") {
+				t.Fatalf("help = %q, want --password", stdout.String()+stderr.String())
+			}
+		})
+	}
+}
+
+func TestValuedPasswordFlagIsRejectedWithoutEchoingValue(t *testing.T) {
+	const secret = "this-must-not-appear"
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"text", "--password=" + secret}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("valued --password unexpectedly succeeded")
+	}
+	if strings.Contains(stdout.String()+stderr.String(), secret) {
+		t.Fatalf("password value was echoed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--password") {
+		t.Fatalf("stderr = %q, want generic password flag error", stderr.String())
+	}
+}
+
+func TestPasswordFlagIsUnsupportedOutsideCreateCommands(t *testing.T) {
+	for _, args := range [][]string{{"delete", "--password"}, {"version", "--password"}, {"--password"}} {
+		t.Run(strings.Join(args, "-"), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if exitCode := run(args, nil, &stdout, &stderr); exitCode == 0 {
+				t.Fatalf("args %v unexpectedly succeeded", args)
+			}
+		})
+	}
+}
+
+func TestCollectPasswordValidation(t *testing.T) {
+	valid := strings.Repeat("a", 12)
+	for _, test := range []struct {
+		name       string
+		apiKey     string
+		password   string
+		confirm    string
+		readerErr  error
+		wantErr    error
+		wantSecret string
+	}{
+		{name: "missing API key", password: valid, confirm: valid, wantErr: errors.New("SNAPIFACT_API_KEY is required with --password")},
+		{name: "reader failure", apiKey: "key", readerErr: errors.New("secret-reader-detail"), wantErr: errPasswordUnavailable},
+		{name: "mismatch", apiKey: "key", password: valid, confirm: valid + "x", wantErr: errPasswordMismatch},
+		{name: "short", apiKey: "key", password: strings.Repeat("a", 11), confirm: strings.Repeat("a", 11), wantErr: errPasswordInvalid},
+		{name: "long", apiKey: "key", password: strings.Repeat("a", 1025), confirm: strings.Repeat("a", 1025), wantErr: errPasswordInvalid},
+		{name: "unicode", apiKey: "key", password: "密码密码密码", confirm: "密码密码密码", wantSecret: "密码密码密码"},
+		{name: "invalid UTF-8", apiKey: "key", password: "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4", confirm: "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4", wantErr: errPasswordInvalid},
+		{name: "minimum", apiKey: "key", password: valid, confirm: valid, wantSecret: valid},
+		{name: "maximum", apiKey: "key", password: strings.Repeat("b", 1024), confirm: strings.Repeat("b", 1024), wantSecret: strings.Repeat("b", 1024)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("SNAPIFACT_API_KEY", test.apiKey)
+			readerCalled := false
+			got, err := collectPassword(true, func() (string, string, error) {
+				readerCalled = true
+				return test.password, test.confirm, test.readerErr
+			})
+			if test.apiKey == "" && readerCalled {
+				t.Fatal("reader called without an API key")
+			}
+			if test.wantErr != nil {
+				if err == nil || err.Error() != test.wantErr.Error() {
+					t.Fatalf("error = %v, want %v", err, test.wantErr)
+				}
+				if test.password != "" && strings.Contains(err.Error(), test.password) {
+					t.Fatal("password was included in validation error")
+				}
+				return
+			}
+			if err != nil || got != test.wantSecret {
+				t.Fatalf("password = %q, error = %v, want %q", got, err, test.wantSecret)
+			}
+		})
+	}
+}
+
+func TestPasswordFailurePrecedesHTTPAndStateMutation(t *testing.T) {
+	_, server, cleanup := testHarness(t)
+	defer cleanup()
+	stateDir := os.Getenv("SNAPIFACT_STATE_DIR")
+
+	t.Setenv("SNAPIFACT_API_KEY", "key")
+	var stdout, stderr bytes.Buffer
+	if exitCode := runWithPasswordReader([]string{"text", "--password"}, strings.NewReader("content"), &stdout, &stderr, func() (string, string, error) {
+		return "", "", errors.New("reader detail")
+	}); exitCode == 0 {
+		t.Fatal("password read failure unexpectedly succeeded")
+	}
+	if server.RequestCount() != 0 {
+		t.Fatalf("request count = %d, want 0", server.RequestCount())
+	}
+	if entries, err := os.ReadDir(stateDir); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("state entries = %v, want none", entries)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), "reader detail") {
+		t.Fatal("reader error detail was exposed")
+	}
+}
+
+func TestPasswordCreatePreservesAPIKeyAndRedactsServerEcho(t *testing.T) {
+	const (
+		apiKey   = "configured-api-key"
+		password = "correct horse battery staple"
+	)
+	var requestCount int
+	var gotKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		gotKey = r.Header.Get("X-Snapifact-API-Key")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), `"password":"`+password+`"`) || !strings.Contains(string(body), `"text":"content"`) {
+			t.Fatalf("request body = %s", body)
+		}
+		writeContractError(w, http.StatusBadRequest, "invalid_password", "server echoed "+password, "password-request-id")
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_API_KEY", apiKey)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := runWithPasswordReader([]string{"text", "--password", "--json"}, strings.NewReader("content"), &stdout, &stderr, func() (string, string, error) {
+		return password, password, nil
+	}); exitCode == 0 {
+		t.Fatal("server error unexpectedly succeeded")
+	}
+	if requestCount != 1 || gotKey != apiKey {
+		t.Fatalf("request count = %d, API key = %q", requestCount, gotKey)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), password) {
+		t.Fatalf("password was exposed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestPasswordSuccessRedactsJSONAndTokenState(t *testing.T) {
+	const password = "correct horse battery staple"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCreateResponseWithTierAndURL(w, "basic", "https://view.test/v/"+password)
+	}))
+	defer server.Close()
+	stateDir := t.TempDir()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_API_KEY", "key")
+	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := runWithPasswordReader([]string{"text", "--password", "--json"}, strings.NewReader("content"), &stdout, &stderr, func() (string, string, error) {
+		return password, password, nil
+	}); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), password) {
+		t.Fatalf("password was exposed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "[REDACTED]") {
+		t.Fatalf("JSON output = %q, want redacted server echo", stdout.String())
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, "snapifact", "tokens", "kpm2q6xxyegw5czekhga"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), password) {
+		t.Fatalf("token state exposed password: %s", data)
 	}
 }
 
@@ -1752,7 +1945,7 @@ func TestEveryCommandHelpContract(t *testing.T) {
 			"zero or one PNG or JPEG file",
 			"Omit [path] or use - to read a PNG or JPEG from stdin",
 			"Image content is limited to 8 MiB",
-			"SNAPIFACT_API_KEY is optional and applies to create requests, including image creation; never sent on delete, view, or raw",
+			"SNAPIFACT_API_KEY is optional for create requests, required with --password, and never sent on delete, view, or raw",
 		} {
 			if !strings.Contains(got, fragment) {
 				t.Fatalf("image help = %q, missing %q", got, fragment)

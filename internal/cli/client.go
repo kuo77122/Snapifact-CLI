@@ -94,6 +94,10 @@ func (e *ErrorResponse) Error() string {
 // buildCreateBody builds the JSON request body for a single-source create.
 // contentType should be "diff", "text", "markdown", "mermaid", "html", or "csv".
 func buildCreateBody(contentType, title, content, filename, description string) io.Reader {
+	return buildCreateBodyWithPassword(contentType, title, content, filename, description, "")
+}
+
+func buildCreateBodyWithPassword(contentType, title, content, filename, description, password string) io.Reader {
 	source := map[string]string{"text": content}
 	if filename != "" {
 		source["filename"] = filename
@@ -107,6 +111,9 @@ func buildCreateBody(contentType, title, content, filename, description string) 
 	}
 	if description != "" {
 		req["description_markdown"] = description
+	}
+	if password != "" {
+		req["password"] = password
 	}
 	var buf bytes.Buffer
 	_ = json.NewEncoder(&buf).Encode(req)
@@ -122,17 +129,31 @@ func CreateSnapshotWithDescription(serverURL, contentType, title, content, descr
 
 // CreateSnapshotWithDescriptionAndFilename sends a named single-source snapshot.
 func CreateSnapshotWithDescriptionAndFilename(serverURL, contentType, title, content, filename, description string) (*CreateResponse, error) {
-	body := buildCreateBody(contentType, title, content, filename, description)
+	return CreateSnapshotWithDescriptionAndFilenameAndPassword(serverURL, contentType, title, content, filename, description, "")
+}
+
+// CreateSnapshotWithDescriptionAndFilenameAndPassword sends a named single-source snapshot with an optional password.
+func CreateSnapshotWithDescriptionAndFilenameAndPassword(serverURL, contentType, title, content, filename, description, password string) (*CreateResponse, error) {
+	body := buildCreateBodyWithPassword(contentType, title, content, filename, description, password)
 	return createSnapshotRequest(serverURL, body)
 }
 
 // CreateCompareSnapshotWithDescription sends exactly two named sources with an optional description.
 func CreateCompareSnapshotWithDescription(serverURL, title, before, beforeFilename, after, afterFilename, description string) (*CreateResponse, error) {
-	body := buildCompareBody(title, before, beforeFilename, after, afterFilename, description)
+	return CreateCompareSnapshotWithDescriptionAndPassword(serverURL, title, before, beforeFilename, after, afterFilename, description, "")
+}
+
+// CreateCompareSnapshotWithDescriptionAndPassword sends a compare snapshot with an optional password.
+func CreateCompareSnapshotWithDescriptionAndPassword(serverURL, title, before, beforeFilename, after, afterFilename, description, password string) (*CreateResponse, error) {
+	body := buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFilename, description, password)
 	return createSnapshotRequest(serverURL, body)
 }
 
 func buildCompareBody(title, before, beforeFilename, after, afterFilename, description string) io.Reader {
+	return buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFilename, description, "")
+}
+
+func buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFilename, description, password string) io.Reader {
 	content := map[string]any{
 		"before": map[string]string{"text": before, "filename": beforeFilename},
 		"after":  map[string]string{"text": after, "filename": afterFilename},
@@ -143,6 +164,9 @@ func buildCompareBody(title, before, beforeFilename, after, afterFilename, descr
 	}
 	if description != "" {
 		req["description_markdown"] = description
+	}
+	if password != "" {
+		req["password"] = password
 	}
 	var buf bytes.Buffer
 	_ = json.NewEncoder(&buf).Encode(req)
@@ -175,6 +199,11 @@ func createSnapshotRequest(serverURL string, body io.Reader) (*CreateResponse, e
 // CreateBinarySnapshot sends an image as the backend's two-part multipart request.
 // It does NOT retry on timeout — the caller handles that.
 func CreateBinarySnapshot(serverURL, title string, content []byte, filename, description string) (*CreateResponse, error) {
+	return CreateBinarySnapshotWithPassword(serverURL, title, content, filename, description, "")
+}
+
+// CreateBinarySnapshotWithPassword sends an image with optional password metadata.
+func CreateBinarySnapshotWithPassword(serverURL, title string, content []byte, filename, description, password string) (*CreateResponse, error) {
 	if len(content) > maxImageContentSize {
 		return nil, fmt.Errorf("image content exceeds 8 MiB limit")
 	}
@@ -197,6 +226,9 @@ func CreateBinarySnapshot(serverURL, title string, content []byte, filename, des
 	}
 	if filename != "" {
 		metadataBody["filename"] = filename
+	}
+	if password != "" {
+		metadataBody["password"] = password
 	}
 	if err := json.NewEncoder(metadata).Encode(metadataBody); err != nil {
 		return nil, fmt.Errorf("encode image metadata: %w", err)
