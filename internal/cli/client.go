@@ -47,10 +47,10 @@ const MaxImageContentSize = 8 << 20
 
 const maxImageContentSize = MaxImageContentSize
 
-// CreateSnapshot sends a file content to the server and returns the response.
+// CreateSnapshot sends UTF-8 text content to the server and returns the response.
 // It does NOT retry on timeout — the caller handles that.
 func CreateSnapshot(serverURL, title, content string) (*CreateResponse, error) {
-	return CreateSnapshotWithDescription(serverURL, "file", title, content, "")
+	return CreateSnapshotWithDescription(serverURL, "text", title, content, "")
 }
 
 // DeleteSnapshot sends a DELETE request to the server. It returns nil on
@@ -92,7 +92,7 @@ func (e *ErrorResponse) Error() string {
 }
 
 // buildCreateBody builds the JSON request body for a single-source create.
-// contentType should be "diff", "file", "markdown", "mermaid", "html", or "csv".
+// contentType should be "diff", "text", "markdown", "mermaid", "html", or "csv".
 func buildCreateBody(contentType, title, content, filename, description string) io.Reader {
 	source := map[string]string{"text": content}
 	if filename != "" {
@@ -115,7 +115,7 @@ func buildCreateBody(contentType, title, content, filename, description string) 
 
 // CreateSnapshotWithDescription sends a single-source snapshot with an optional
 // description to the server and returns the response.
-// contentType should be "diff", "file", "markdown", "mermaid", "html", or "csv".
+// contentType should be "diff", "text", "markdown", "mermaid", "html", or "csv".
 func CreateSnapshotWithDescription(serverURL, contentType, title, content, description string) (*CreateResponse, error) {
 	return CreateSnapshotWithDescriptionAndFilename(serverURL, contentType, title, content, "", description)
 }

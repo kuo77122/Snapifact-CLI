@@ -21,7 +21,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// CLI integration tests for snapifact file and delete commands.
+// CLI integration tests for snapifact text and delete commands.
 // ---------------------------------------------------------------------------
 
 type contractTestServer struct {
@@ -177,8 +177,8 @@ func testHarness(t *testing.T) (serverURL string, server *contractTestServer, cl
 	return server.URL, server, server.Close
 }
 
-// fileCreateOutput is the output we expect from --json mode.
-type fileCreateOutput struct {
+// createOutput is the output we expect from --json mode.
+type createOutput struct {
 	ID          string `json:"id"`
 	URL         string `json:"url"`
 	ExpiresAt   string `json:"expires_at"`
@@ -193,7 +193,7 @@ type errorOutput struct {
 	RequestID string `json:"request_id"`
 }
 
-func TestFileFromPathDefaultOutput(t *testing.T) {
+func TestTextFromPathDefaultOutput(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
@@ -205,7 +205,7 @@ func TestFileFromPathDefaultOutput(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", srcPath}, nil, &stdout, &stderr)
+	exitCode := run([]string{"text", srcPath}, nil, &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
@@ -218,6 +218,41 @@ func TestFileFromPathDefaultOutput(t *testing.T) {
 	}
 	if stderr.Len() > 0 {
 		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+}
+
+func TestTextCommandUsesTextContentType(t *testing.T) {
+	_, server, cleanup := testHarness(t)
+	defer cleanup()
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"text"}, strings.NewReader("plain UTF-8 text"), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	var request struct {
+		ContentType string `json:"content_type"`
+		Content     struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(server.LastCreateBody()), &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.ContentType != "text" || request.Content.Text != "plain UTF-8 text" {
+		t.Fatalf("text request = %+v", request)
+	}
+}
+
+func TestFileCommandIsUnknown(t *testing.T) {
+	_, server, cleanup := testHarness(t)
+	defer cleanup()
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"file"}, strings.NewReader("must not upload"), &stdout, &stderr); exitCode == 0 {
+		t.Fatal("file command unexpectedly succeeded")
+	}
+	if !strings.Contains(stderr.String(), "unknown command: file") || server.RequestCount() != 0 {
+		t.Fatalf("unknown command output = stdout %q stderr %q requests %d", stdout.String(), stderr.String(), server.RequestCount())
 	}
 }
 
@@ -340,7 +375,7 @@ func TestCompareFromFilesJSONOutputAndMetadata(t *testing.T) {
 	if exitCode := run([]string{"compare", "--json", "--title", "Review", "--description-file", descriptionPath, beforePath, afterPath}, nil, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 	}
@@ -386,13 +421,13 @@ func TestCompareReadFailureDoesNotUpload(t *testing.T) {
 	}
 }
 
-func TestFileFromStdinDefaultOutput(t *testing.T) {
+func TestTextFromStdinDefaultOutput(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
 	input := "stdin content here"
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file"}, strings.NewReader(input), &stdout, &stderr)
+	exitCode := run([]string{"text"}, strings.NewReader(input), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
@@ -405,12 +440,12 @@ func TestFileFromStdinDefaultOutput(t *testing.T) {
 	}
 }
 
-func TestFileFromExplicitStdinDash(t *testing.T) {
+func TestTextFromExplicitStdinDash(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "-"}, strings.NewReader("dash stdin"), &stdout, &stderr)
+	exitCode := run([]string{"text", "-"}, strings.NewReader("dash stdin"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
@@ -434,7 +469,7 @@ func TestCSVFromPathJSONOutputAndMetadata(t *testing.T) {
 	if exitCode := run([]string{"csv", "--json", "--title", "Report", path}, nil, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 	}
@@ -490,16 +525,16 @@ func TestCSVFromExplicitStdinDashIsURLOnly(t *testing.T) {
 	}
 }
 
-func TestFileJSONOutput(t *testing.T) {
+func TestTextJSONOutput(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--json"}, strings.NewReader("json test"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--json"}, strings.NewReader("json test"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 	}
@@ -511,16 +546,16 @@ func TestFileJSONOutput(t *testing.T) {
 	}
 }
 
-func TestFileWithTitle(t *testing.T) {
+func TestTextWithTitle(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--title", "My Title", "--json"}, strings.NewReader("titled content"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--title", "My Title", "--json"}, strings.NewReader("titled content"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("stdout JSON error = %v", err)
 	}
@@ -529,14 +564,14 @@ func TestFileWithTitle(t *testing.T) {
 	}
 }
 
-func TestFileServerErrorOutput(t *testing.T) {
+func TestTextServerErrorOutput(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
 	// Send invalid content to trigger server error (source too large)
 	largeContent := strings.Repeat("a", 6<<20) // 6 MiB > 5 MiB limit
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file"}, strings.NewReader(largeContent), &stdout, &stderr)
+	exitCode := run([]string{"text"}, strings.NewReader(largeContent), &stdout, &stderr)
 	if exitCode == 0 {
 		t.Fatalf("expected non-zero exit for server error, got 0")
 	}
@@ -567,7 +602,7 @@ func TestCreateErrorRedactsConfiguredAPIKey(t *testing.T) {
 	t.Setenv("SNAPIFACT_API_KEY", apiKey)
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+	if exitCode := run([]string{"text"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
 		t.Fatal("server error unexpectedly succeeded")
 	}
 	if stdout.Len() != 0 || strings.Contains(stderr.String(), apiKey) {
@@ -704,11 +739,11 @@ func TestTokenPermissions(t *testing.T) {
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--json"}, strings.NewReader("perm check"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--json"}, strings.NewReader("perm check"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +793,7 @@ func TestStaleTokenCleanup(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--json"}, strings.NewReader("cleanup test"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--json"}, strings.NewReader("cleanup test"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
@@ -776,7 +811,7 @@ func TestTokenNotInNormalStdout(t *testing.T) {
 	defer cleanup()
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file"}, strings.NewReader("no token leak"), &stdout, &stderr)
+	exitCode := run([]string{"text"}, strings.NewReader("no token leak"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
@@ -815,7 +850,7 @@ func TestKeyedDowngradeDeletesWithoutAPIKeyAndPrintsNoSuccess(t *testing.T) {
 	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+	if exitCode := run([]string{"text"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
 		t.Fatal("keyed downgrade unexpectedly succeeded")
 	}
 	if stdout.Len() != 0 {
@@ -856,10 +891,10 @@ func TestKeyedAcceptedTiersPreserveJSONResponse(t *testing.T) {
 			t.Setenv("SNAPIFACT_API_KEY", "configured-key")
 
 			var stdout, stderr bytes.Buffer
-			if exitCode := run([]string{"file", "--json"}, strings.NewReader("content"), &stdout, &stderr); exitCode != 0 {
+			if exitCode := run([]string{"text", "--json"}, strings.NewReader("content"), &stdout, &stderr); exitCode != 0 {
 				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 			}
-			var output fileCreateOutput
+			var output createOutput
 			if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
 				t.Fatal(err)
 			}
@@ -900,7 +935,7 @@ func TestKeyedDowngradeTiersAreAllCompensated(t *testing.T) {
 			t.Setenv("SNAPIFACT_API_KEY", "configured-key")
 
 			var stdout, stderr bytes.Buffer
-			if exitCode := run([]string{"file", "--json"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+			if exitCode := run([]string{"text", "--json"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
 				t.Fatal("downgrade unexpectedly succeeded")
 			}
 			if stdout.Len() != 0 || stderr.String() != "error: server did not apply the configured API key; snapshot was deleted\n" {
@@ -939,7 +974,7 @@ func TestKeyedDowngradeDeleteFailureSavesRecoveryToken(t *testing.T) {
 	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+	if exitCode := run([]string{"text"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
 		t.Fatal("downgrade unexpectedly succeeded")
 	}
 	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "Snapshot URL: https://view.test/v/"+id) || !strings.Contains(stderr.String(), "saved locally") {
@@ -980,7 +1015,7 @@ func TestKeyedDowngradeDeleteAndTokenSaveFailureIsLastResort(t *testing.T) {
 	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+	if exitCode := run([]string{"text"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
 		t.Fatal("downgrade unexpectedly succeeded")
 	}
 	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "Snapshot delete token: "+token) || !strings.Contains(stderr.String(), "Save error:") || !strings.Contains(stderr.String(), "Delete error:") {
@@ -1014,7 +1049,7 @@ func TestKeyedAcceptedTierWithMalformedExpiryUsesExistingCompensation(t *testing
 	t.Setenv("SNAPIFACT_API_KEY", "configured-key")
 
 	var stdout, stderr bytes.Buffer
-	if exitCode := run([]string{"file"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
+	if exitCode := run([]string{"text"}, strings.NewReader("content"), &stdout, &stderr); exitCode == 0 {
 		t.Fatal("malformed expiry unexpectedly succeeded")
 	}
 	if stdout.Len() != 0 || deleteCount.Load() != 1 || !strings.Contains(stderr.String(), "token save error") || strings.Contains(stderr.String(), "WARNING") {
@@ -1036,7 +1071,7 @@ func TestNoAutoRetryOnTimeout(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file"}, strings.NewReader("no retry"), &stdout, &stderr)
+	exitCode := run([]string{"text"}, strings.NewReader("no retry"), &stdout, &stderr)
 	if exitCode == 0 {
 		t.Fatalf("expected non-zero exit for server error, got 0")
 	}
@@ -1058,7 +1093,7 @@ func TestTokenSaveFailureCompensatingDeleteSuccess(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", filepath.Join(readonlyParent, "sub"))
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--json"}, strings.NewReader("compensating delete success"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--json"}, strings.NewReader("compensating delete success"), &stdout, &stderr)
 	if exitCode == 0 {
 		t.Fatalf("expected non-zero exit for token save failure, got 0")
 	}
@@ -1114,7 +1149,7 @@ func TestTokenSaveFailureCompensatingDeleteFailsRecoveryWarning(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", filepath.Join(readonlyParent, "sub"))
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--json"}, strings.NewReader("recovery test"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--json"}, strings.NewReader("recovery test"), &stdout, &stderr)
 	if exitCode == 0 {
 		t.Fatalf("expected non-zero exit for token save failure, got 0")
 	}
@@ -1182,7 +1217,7 @@ func TestMarkdownPathThenOptionsCreatesTitledJSONSnapshot(t *testing.T) {
 	if exitCode := run([]string{"markdown", contentPath, "-title", "My First Snapshot", "-json"}, nil, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var response fileCreateOutput
+	var response createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 		t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 	}
@@ -1268,7 +1303,7 @@ func equalStrings(got, want []string) bool {
 }
 
 func TestSharedUploadsAcceptTrailingAndInterspersedOptions(t *testing.T) {
-	for _, command := range []string{"diff", "file", "markdown", "mermaid", "html", "csv"} {
+	for _, command := range []string{"diff", "text", "markdown", "mermaid", "html", "csv"} {
 		for _, ordering := range []string{"trailing", "interspersed"} {
 			t.Run(command+"/"+ordering, func(t *testing.T) {
 				_, server, cleanup := testHarness(t)
@@ -1289,7 +1324,7 @@ func TestSharedUploadsAcceptTrailingAndInterspersedOptions(t *testing.T) {
 				if exitCode := run(args, nil, &stdout, &stderr); exitCode != 0 {
 					t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 				}
-				var response fileCreateOutput
+				var response createOutput
 				if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 					t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 				}
@@ -1342,7 +1377,7 @@ func TestCompareAcceptsOptionsBetweenAndAfterOperands(t *testing.T) {
 			if exitCode := run(args, nil, &stdout, &stderr); exitCode != 0 {
 				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 			}
-			var response fileCreateOutput
+			var response createOutput
 			if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 				t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 			}
@@ -1445,7 +1480,7 @@ func TestMarkdownJSONOutput(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("stdout JSON error = %v, body = %s", err, stdout.String())
 	}
@@ -1478,22 +1513,22 @@ func TestMarkdownWithDescriptionFile(t *testing.T) {
 	}
 }
 
-func TestFileWithDescriptionFile(t *testing.T) {
+func TestTextWithDescriptionFile(t *testing.T) {
 	_, _, cleanup := testHarness(t)
 	defer cleanup()
 
 	root := t.TempDir()
 	descPath := filepath.Join(root, "desc.md")
-	if err := os.WriteFile(descPath, []byte("## Notes\n\nAbout this file."), 0644); err != nil {
+	if err := os.WriteFile(descPath, []byte("## Notes\n\nAbout this text."), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	var stdout, stderr bytes.Buffer
-	exitCode := run([]string{"file", "--description-file", descPath, "--json"}, strings.NewReader("file content"), &stdout, &stderr)
+	exitCode := run([]string{"text", "--description-file", descPath, "--json"}, strings.NewReader("text content"), &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
 	}
-	var out fileCreateOutput
+	var out createOutput
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
@@ -1688,7 +1723,7 @@ func TestEveryCommandHelpContract(t *testing.T) {
 		"printf",
 		"--description-file -",
 	}
-	for _, command := range []string{"diff", "file", "markdown", "mermaid", "html", "csv"} {
+	for _, command := range []string{"diff", "text", "markdown", "mermaid", "html", "csv"} {
 		t.Run(command, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if exitCode := run([]string{command, "--help"}, nil, &stdout, &stderr); exitCode != 0 {
@@ -1699,6 +1734,9 @@ func TestEveryCommandHelpContract(t *testing.T) {
 				if !strings.Contains(got, fragment) {
 					t.Fatalf("help output = %q, missing %q", got, fragment)
 				}
+			}
+			if command == "text" && !strings.Contains(got, "UTF-8 plain text or source code") {
+				t.Fatalf("text help = %q, missing UTF-8 text description", got)
 			}
 		})
 	}
@@ -1772,7 +1810,7 @@ func TestHelpHasNoFileStdinTokenOrHTTPSideEffects(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
 
 	commands := [][]string{{"--help"}, {"version", "--help"}, {"delete", "--help"}}
-	for _, command := range []string{"diff", "compare", "file", "markdown", "mermaid", "html", "csv", "image"} {
+	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "image"} {
 		commands = append(commands, []string{command, "missing-file", "--help"})
 	}
 	for _, args := range commands {
@@ -1799,7 +1837,7 @@ func TestHTTPContractHandlerCapturesCreateRequest(t *testing.T) {
 	server := newContractTestServer(t)
 	defer server.Close()
 
-	wrongType, err := http.Post(server.URL+"/v1/snapshots", "text/plain", strings.NewReader(`{"content_type":"file","content":{"text":"contract"}}`))
+	wrongType, err := http.Post(server.URL+"/v1/snapshots", "text/plain", strings.NewReader(`{"content_type":"text","content":{"text":"contract"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1808,7 +1846,7 @@ func TestHTTPContractHandlerCapturesCreateRequest(t *testing.T) {
 		t.Fatalf("wrong content type status = %d, want %d", wrongType.StatusCode, http.StatusUnsupportedMediaType)
 	}
 
-	resp, err := http.Post(server.URL+"/v1/snapshots", "application/json", strings.NewReader(`{"content_type":"file","content":{"text":"contract"}}`))
+	resp, err := http.Post(server.URL+"/v1/snapshots", "application/json", strings.NewReader(`{"content_type":"text","content":{"text":"contract"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1816,7 +1854,7 @@ func TestHTTPContractHandlerCapturesCreateRequest(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d, want %d", resp.StatusCode, http.StatusCreated)
 	}
-	if got := server.LastCreateBody(); !strings.Contains(got, `"content_type":"file"`) {
+	if got := server.LastCreateBody(); !strings.Contains(got, `"content_type":"text"`) {
 		t.Fatalf("captured create body = %q", got)
 	}
 }

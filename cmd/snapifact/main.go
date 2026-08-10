@@ -21,7 +21,7 @@ const usageText = `usage: snapifact <command> [options]
 Commands:
   diff       upload a unified diff snapshot
   compare    compare two UTF-8 files
-  file       upload a file snapshot
+  text       upload a UTF-8 plain text or source code snapshot
   markdown   upload a markdown snapshot
   mermaid    upload a Mermaid diagram snapshot
   html       upload a sandboxed HTML snapshot
@@ -48,7 +48,7 @@ Options:
 
 Examples:
   printf 'content\n' | snapifact markdown
-  snapifact file path/to/file.txt --title "Review" --json
+  snapifact text path/to/file.txt --title "Review" --json
   snapifact compare before.txt after.txt
   snapifact delete kpm2q6xxyegw5czekhga
 `
@@ -85,10 +85,14 @@ Examples:
 `
 
 func uploadUsageText(contentType string) string {
+	pathDescription := "zero or one content file"
+	if contentType == "text" {
+		pathDescription = "zero or one UTF-8 plain text or source code file"
+	}
 	return fmt.Sprintf(`Usage: snapifact %s [options] [path]
 
 Arguments:
-  [path]  zero or one content file
+  [path]  %s
 
 Rules:
   Omit [path] or use - to read content from stdin.
@@ -102,7 +106,7 @@ Rules:
   snapifact %s -- --content-file
   snapifact %s --description-file - path/to/content
   Invalid: printf 'content\n' | snapifact %s --description-file -
-`, contentType, sharedOptionsText, contentType, contentType, contentType, contentType, contentType)
+`, contentType, pathDescription, sharedOptionsText, contentType, contentType, contentType, contentType, contentType)
 }
 
 const imageUsageText = `Usage: snapifact image [options] [path|-]
@@ -166,8 +170,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runUpload("diff", rest, stdin, stdout, stderr)
 	case "compare":
 		return runCompare(rest, stdin, stdout, stderr)
-	case "file":
-		return runUpload("file", rest, stdin, stdout, stderr)
+	case "text":
+		return runUpload("text", rest, stdin, stdout, stderr)
 	case "markdown":
 		return runUpload("markdown", rest, stdin, stdout, stderr)
 	case "mermaid":
