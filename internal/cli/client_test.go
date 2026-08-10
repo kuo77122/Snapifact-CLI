@@ -68,6 +68,77 @@ func TestCreateSnapshotOmitsAPIKeyWhenUnset(t *testing.T) {
 	}
 }
 
+func TestCreateSnapshotWithPasswordSendsPasswordOnceAndPreservesAPIKey(t *testing.T) {
+	const (
+		apiKey   = "create-api-key"
+		password = "correct horse battery staple"
+	)
+	var requestCount int
+	var request map[string]any
+	var gotKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		gotKey = r.Header.Get("X-Snapifact-API-Key")
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		writeCreateResponse(w)
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_API_KEY", apiKey)
+
+	if _, err := CreateSnapshotWithDescriptionAndFilenameAndPassword(server.URL, "markdown", "Review", "body", "", "", password); err != nil {
+		t.Fatal(err)
+	}
+	if requestCount != 1 || gotKey != apiKey {
+		t.Fatalf("request count = %d, API key = %q", requestCount, gotKey)
+	}
+	if request["password"] != password {
+		t.Fatalf("password = %#v, want %q", request["password"], password)
+	}
+}
+
+func TestCompatibilityJSONBuildersOmitPassword(t *testing.T) {
+	for name, body := range map[string]io.Reader{
+		"single":  buildCreateBody("markdown", "", "body", "", ""),
+		"compare": buildCompareBody("", "before", "before.txt", "after", "after.txt", ""),
+	} {
+		raw, err := io.ReadAll(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), `"password"`) {
+			t.Fatalf("%s body = %s, contains password", name, raw)
+		}
+	}
+}
+
+func TestCreateCompareSnapshotWithPasswordIncludesOneTopLevelPassword(t *testing.T) {
+	var request map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(string(body), `"password"`) != 1 {
+			t.Fatalf("request body = %s, want one password field", body)
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		writeCreateResponse(w)
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_API_KEY", "key")
+
+	if _, err := CreateCompareSnapshotWithDescriptionAndPassword(server.URL, "Review", "before", "before.txt", "after", "after.txt", "", "unicode-password-✓"); err != nil {
+		t.Fatal(err)
+	}
+	if request["password"] != "unicode-password-✓" {
+		t.Fatalf("password = %#v", request["password"])
+	}
+}
+
 func TestCreateBinarySnapshotUsesExactMultipartContract(t *testing.T) {
 	const apiKey = "binary-create-key"
 	content := []byte("\x89PNG\r\n\x1a\nimage bytes")
@@ -92,13 +163,20 @@ func TestCreateBinarySnapshotUsesExactMultipartContract(t *testing.T) {
 		if metadata.FormName() != "metadata" || metadata.Header.Get("Content-Type") != "application/json" {
 			t.Fatalf("metadata headers = %v", metadata.Header)
 		}
+		metadataRaw, err := io.ReadAll(metadata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(metadataRaw), `"password"`) {
+			t.Fatalf("metadata = %s, contains password", metadataRaw)
+		}
 		var gotMetadata struct {
 			ContentType         string `json:"content_type"`
 			Title               string `json:"title"`
 			DescriptionMarkdown string `json:"description_markdown"`
 			Filename            string `json:"filename"`
 		}
-		if err := json.NewDecoder(metadata).Decode(&gotMetadata); err != nil {
+		if err := json.Unmarshal(metadataRaw, &gotMetadata); err != nil {
 			t.Fatal(err)
 		}
 		if gotMetadata.ContentType != "image" || gotMetadata.Title != "Review" || gotMetadata.DescriptionMarkdown != "## Notes" || gotMetadata.Filename != "photo.png" {
@@ -132,6 +210,52 @@ func TestCreateBinarySnapshotUsesExactMultipartContract(t *testing.T) {
 	}
 	if response.URL == "" || requestCount != 1 {
 		t.Fatalf("response=%+v request count=%d", response, requestCount)
+	}
+}
+
+func TestCreateBinarySnapshotWithPasswordPreservesPartOrderAndMetadata(t *testing.T) {
+	const password = "correct horse battery staple"
+	content := []byte("image bytes")
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		metadata, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gotMetadata map[string]any
+		if err := json.NewDecoder(metadata).Decode(&gotMetadata); err != nil {
+			t.Fatal(err)
+		}
+		if gotMetadata["password"] != password {
+			t.Fatalf("metadata password = %#v", gotMetadata["password"])
+		}
+		contentPart, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotContent, err := io.ReadAll(contentPart)
+		if err != nil || string(gotContent) != string(content) {
+			t.Fatalf("content = %q, error = %v", gotContent, err)
+		}
+		if _, err := reader.NextPart(); err != io.EOF {
+			t.Fatalf("multipart parts have trailing data: %v", err)
+		}
+		writeCreateResponse(w)
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_API_KEY", "key")
+
+	if _, err := CreateBinarySnapshotWithPassword(server.URL, "Review", content, "photo.png", "", password); err != nil {
+		t.Fatal(err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
 	}
 }
 

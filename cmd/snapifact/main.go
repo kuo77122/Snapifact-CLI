@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/kuo77122/snapifact-cli/internal/cli"
+	"golang.org/x/term"
 )
 
 const usageText = `usage: snapifact <command> [options]
@@ -42,7 +44,7 @@ Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
   --json                         output the full JSON response instead of only the snapshot URL
-  SNAPIFACT_API_KEY              optional API key for create requests; never sent on delete, view, or raw
+  SNAPIFACT_API_KEY              optional API key for create requests; required with --password
 
   --description-file - reads the description from stdin and cannot be combined with content also read from stdin.
 
@@ -57,6 +59,7 @@ const sharedOptionsText = `Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
   --json                         output the full JSON response instead of only the snapshot URL
+  --password                     prompt securely for a password and confirmation
 `
 
 const versionUsageText = `Usage: snapifact version
@@ -115,7 +118,7 @@ Rules:
   Options may appear before or after the operand.
   Use -- before a dash-prefixed path.
   Image content is limited to 8 MiB.
-  SNAPIFACT_API_KEY is optional and applies to create requests, including image creation; never sent on delete, view, or raw.
+  SNAPIFACT_API_KEY is optional for create requests, required with --password, and never sent on delete, view, or raw.
   --description-file - uses stdin for the description, so it is invalid when content also comes from stdin.
 
 ` + sharedOptionsText + `Examples:
@@ -142,13 +145,31 @@ Rules:
 
 var version = "dev"
 
+type passwordReader func() (password, confirmation string, err error)
+
+var errPasswordValue = errors.New("--password does not accept a value")
+
+var errPasswordUnavailable = errors.New("unable to read password securely")
+
+var errPasswordMismatch = errors.New("password confirmation does not match")
+
+var errPasswordInvalid = errors.New("password must be valid UTF-8 and 12-1024 bytes")
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runWithPasswordReader(args, stdin, stdout, stderr, readPasswordFromTTY)
+}
+
+func runWithPasswordReader(args []string, stdin io.Reader, stdout, stderr io.Writer, readPassword passwordReader) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usageText)
+		return 1
+	}
+	if err := rejectValuedPasswordFlag(args); err != nil {
+		fmt.Fprintln(stderr, err)
 		return 1
 	}
 
@@ -163,25 +184,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "snapifact %s\n", cliVersion())
 		return 0
 	case "diff":
-		return runUpload("diff", rest, stdin, stdout, stderr)
+		return runUpload("diff", rest, stdin, stdout, stderr, readPassword)
 	case "compare":
-		return runCompare(rest, stdin, stdout, stderr)
+		return runCompare(rest, stdin, stdout, stderr, readPassword)
 	case "file":
-		return runUpload("file", rest, stdin, stdout, stderr)
+		return runUpload("file", rest, stdin, stdout, stderr, readPassword)
 	case "markdown":
-		return runUpload("markdown", rest, stdin, stdout, stderr)
+		return runUpload("markdown", rest, stdin, stdout, stderr, readPassword)
 	case "mermaid":
-		return runUpload("mermaid", rest, stdin, stdout, stderr)
+		return runUpload("mermaid", rest, stdin, stdout, stderr, readPassword)
 	case "html":
-		return runUpload("html", rest, stdin, stdout, stderr)
+		return runUpload("html", rest, stdin, stdout, stderr, readPassword)
 	case "csv":
-		return runUpload("csv", rest, stdin, stdout, stderr)
+		return runUpload("csv", rest, stdin, stdout, stderr, readPassword)
 	case "image":
-		return runImage(rest, stdin, stdout, stderr)
+		return runImage(rest, stdin, stdout, stderr, readPassword)
 	case "delete":
 		return runDelete(rest, stdout, stderr)
 	case "version":
-		return runVersion(rest, stdout)
+		return runVersion(rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n\n%s", cmd, usageText)
 		return 1
@@ -218,6 +239,9 @@ func parseSnapshotArgs(flags *flag.FlagSet, args []string) ([]string, error) {
 			operands = append(operands, arg)
 			continue
 		}
+		if isValuedPasswordFlag(arg) {
+			return nil, errPasswordValue
+		}
 
 		options = append(options, arg)
 		name := strings.TrimLeft(arg, "-")
@@ -249,13 +273,30 @@ func isBoolFlag(value flag.Value) bool {
 	return ok && boolValue.IsBoolFlag()
 }
 
-func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func rejectValuedPasswordFlag(args []string) error {
+	for _, arg := range args {
+		if arg == "--" {
+			return nil
+		}
+		if isValuedPasswordFlag(arg) {
+			return errPasswordValue
+		}
+	}
+	return nil
+}
+
+func isValuedPasswordFlag(arg string) bool {
+	return strings.HasPrefix(arg, "--password=") || strings.HasPrefix(arg, "-password=")
+}
+
+func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer, readPassword passwordReader) int {
 	flags := flag.NewFlagSet("compare", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(flags.Output(), compareUsageText) }
 	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
+	passwordRequested := flags.Bool("password", false, "prompt securely for a password and confirmation")
 	operands, err := parseSnapshotArgs(flags, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -282,25 +323,31 @@ func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return 1
 	}
+	password, err := collectPassword(*passwordRequested, readPassword)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 	serverURL := cli.ServerURL()
 	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
 	cli.CleanStaleTokens(tokenDir)
-	response, err := cli.CreateCompareSnapshotWithDescription(serverURL, *title, string(before), filepath.Base(beforePath), string(after), filepath.Base(afterPath), description)
+	response, err := cli.CreateCompareSnapshotWithDescriptionAndPassword(serverURL, *title, string(before), filepath.Base(beforePath), string(after), filepath.Base(afterPath), description, password)
 	if err != nil {
-		writeCLIError(stderr, err)
+		writeCLIError(stderr, err, password)
 		return 1
 	}
-	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr)
+	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr, password)
 }
 
 // runUpload reads content (and optional description) and sends a snapshot to the server.
-func runUpload(contentType string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runUpload(contentType string, args []string, stdin io.Reader, stdout, stderr io.Writer, readPassword passwordReader) int {
 	flags := flag.NewFlagSet(contentType, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(flags.Output(), uploadUsageText(contentType)) }
 	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
+	passwordRequested := flags.Bool("password", false, "prompt securely for a password and confirmation")
 
 	operands, err := parseSnapshotArgs(flags, args)
 	if err != nil {
@@ -347,6 +394,11 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 	if err != nil {
 		return 1
 	}
+	password, err := collectPassword(*passwordRequested, readPassword)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 
 	serverURL := cli.ServerURL()
 	stateDir := os.Getenv("SNAPIFACT_STATE_DIR")
@@ -360,21 +412,22 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 	if contentType == "csv" && !contentFromStdin {
 		filename = filepath.Base(operands[0])
 	}
-	resp, err := cli.CreateSnapshotWithDescriptionAndFilename(serverURL, contentType, *title, content, filename, description)
+	resp, err := cli.CreateSnapshotWithDescriptionAndFilenameAndPassword(serverURL, contentType, *title, content, filename, description, password)
 	if err != nil {
-		writeCLIError(stderr, err)
+		writeCLIError(stderr, err, password)
 		return 1
 	}
-	return finishCreate(serverURL, tokenDir, resp, *jsonMode, stdout, stderr)
+	return finishCreate(serverURL, tokenDir, resp, *jsonMode, stdout, stderr, password)
 }
 
-func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer, readPassword passwordReader) int {
 	flags := flag.NewFlagSet("image", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(flags.Output(), imageUsageText) }
 	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
+	passwordRequested := flags.Bool("password", false, "prompt securely for a password and confirmation")
 
 	operands, err := parseSnapshotArgs(flags, args)
 	if err != nil {
@@ -403,6 +456,11 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return 1
 	}
+	password, err := collectPassword(*passwordRequested, readPassword)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 
 	serverURL := cli.ServerURL()
 	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
@@ -411,12 +469,12 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if !contentFromStdin {
 		filename = filepath.Base(operands[0])
 	}
-	response, err := cli.CreateBinarySnapshot(serverURL, *title, content, filename, description)
+	response, err := cli.CreateBinarySnapshotWithPassword(serverURL, *title, content, filename, description, password)
 	if err != nil {
-		writeCLIError(stderr, err)
+		writeCLIError(stderr, err, password)
 		return 1
 	}
-	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr)
+	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr, password)
 }
 
 func readImageContent(operands []string, contentFromStdin bool, stdin io.Reader) ([]byte, error) {
@@ -441,17 +499,18 @@ func readImageContent(operands []string, contentFromStdin bool, stdin io.Reader)
 	return content, nil
 }
 
-func writeCLIError(stderr io.Writer, err error) {
+func writeCLIError(stderr io.Writer, err error, secrets ...string) {
 	var errResp *cli.ErrorResponse
 	if errors.As(err, &errResp) {
 		out, _ := json.Marshal(errResp)
-		fmt.Fprintln(stderr, sanitizeText(string(out)))
+		fmt.Fprintln(stderr, sanitizeText(string(out), secrets...))
 	} else {
-		fmt.Fprintf(stderr, "error: %s\n", sanitizeError(err))
+		fmt.Fprintf(stderr, "error: %s\n", sanitizeError(err, secrets...))
 	}
 }
 
-func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode bool, stdout, stderr io.Writer) int {
+func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode bool, stdout, stderr io.Writer, password string) int {
+	resp = redactCreateResponse(resp, password)
 	if os.Getenv("SNAPIFACT_API_KEY") != "" && !acceptedKeyedTier(resp.Tier) {
 		if err := cli.DeleteSnapshot(serverURL, resp.ID, resp.DeleteToken); err == nil {
 			fmt.Fprintln(stderr, "error: server did not apply the configured API key; snapshot was deleted")
@@ -462,14 +521,14 @@ func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode
 				fmt.Fprintln(stderr, "WARNING: server did not apply the configured API key and compensating delete failed.")
 				fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
 				fmt.Fprintln(stderr, "Snapshot delete token saved locally.")
-				fmt.Fprintf(stderr, "Delete error: %s\n", sanitizeError(deleteErr, resp.DeleteToken))
+				fmt.Fprintf(stderr, "Delete error: %s\n", sanitizeError(deleteErr, resp.DeleteToken, password))
 				return 1
 			} else {
 				fmt.Fprintln(stderr, "WARNING: server did not apply the configured API key and also failed to revoke the snapshot.")
 				fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
 				fmt.Fprintf(stderr, "Snapshot delete token: %s\n", resp.DeleteToken)
 				fmt.Fprintf(stderr, "Save error: %v\n", saveErr)
-				fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(deleteErr))
+				fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(deleteErr, password))
 				return 1
 			}
 		}
@@ -483,7 +542,7 @@ func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode
 			fmt.Fprintf(stderr, "Snapshot URL: %s\n", resp.URL)
 			fmt.Fprintf(stderr, "Snapshot delete token: %s\n", resp.DeleteToken)
 			fmt.Fprintf(stderr, "Save error: %v\n", err)
-			fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(delErr))
+			fmt.Fprintf(stderr, "Delete error: %v\n", sanitizeError(delErr, password))
 		} else {
 			// Compensating delete succeeded — no URL, non-zero exit
 			fmt.Fprintf(stderr, "error: snapshot created but failed to save delete token locally; snapshot was revoked on the server.\n")
@@ -502,6 +561,20 @@ func finishCreate(serverURL, tokenDir string, resp *cli.CreateResponse, jsonMode
 	return 0
 }
 
+func redactCreateResponse(resp *cli.CreateResponse, password string) *cli.CreateResponse {
+	if resp == nil || password == "" {
+		return resp
+	}
+	redact := func(value string) string { return strings.ReplaceAll(value, password, "[REDACTED]") }
+	copy := *resp
+	copy.ID = redact(copy.ID)
+	copy.URL = redact(copy.URL)
+	copy.ExpiresAt = redact(copy.ExpiresAt)
+	copy.DeleteToken = redact(copy.DeleteToken)
+	copy.Tier = redact(copy.Tier)
+	return &copy
+}
+
 func acceptedKeyedTier(tier string) bool {
 	switch tier {
 	case "basic", "pro", "admin":
@@ -515,8 +588,8 @@ func sanitizeError(err error, extra ...string) string {
 	return sanitizeTextWithSecrets(err.Error(), extra...)
 }
 
-func sanitizeText(text string) string {
-	return sanitizeTextWithSecrets(text)
+func sanitizeText(text string, extra ...string) string {
+	return sanitizeTextWithSecrets(text, extra...)
 }
 
 func sanitizeTextWithSecrets(text string, extra ...string) string {
@@ -553,6 +626,61 @@ func readDescription(descFile string, contentFromStdin bool, stdin io.Reader, st
 		return "", err
 	}
 	return string(data), nil
+}
+
+func collectPassword(requested bool, reader passwordReader) (string, error) {
+	if !requested {
+		return "", nil
+	}
+	if os.Getenv("SNAPIFACT_API_KEY") == "" {
+		return "", errors.New("SNAPIFACT_API_KEY is required with --password")
+	}
+	if reader == nil {
+		return "", errPasswordUnavailable
+	}
+
+	password, confirmation, err := reader()
+	if err != nil {
+		return "", errPasswordUnavailable
+	}
+	if password != confirmation {
+		return "", errPasswordMismatch
+	}
+	if !utf8.ValidString(password) || !utf8.ValidString(confirmation) || len([]byte(password)) < 12 || len([]byte(password)) > 1024 {
+		return "", errPasswordInvalid
+	}
+	return password, nil
+}
+
+func readPasswordFromTTY() (string, string, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return "", "", err
+	}
+	defer tty.Close()
+	if !term.IsTerminal(int(tty.Fd())) {
+		return "", "", errors.New("controlling terminal is not a terminal")
+	}
+
+	if _, err := fmt.Fprint(tty, "Password: "); err != nil {
+		return "", "", err
+	}
+	password, err := term.ReadPassword(int(tty.Fd()))
+	if _, newlineErr := fmt.Fprintln(tty); err != nil {
+		return "", "", err
+	} else if newlineErr != nil {
+		return "", "", newlineErr
+	}
+	if _, err := fmt.Fprint(tty, "Confirm password: "); err != nil {
+		return "", "", err
+	}
+	confirmation, err := term.ReadPassword(int(tty.Fd()))
+	if _, newlineErr := fmt.Fprintln(tty); err != nil {
+		return "", "", err
+	} else if newlineErr != nil {
+		return "", "", newlineErr
+	}
+	return string(password), string(confirmation), nil
 }
 
 func runDelete(args []string, stdout, stderr io.Writer) int {
@@ -603,11 +731,15 @@ func runDelete(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runVersion(args []string, stdout io.Writer) int {
+func runVersion(args []string, stdout, stderr io.Writer) int {
 	for _, arg := range args {
 		if arg == "--help" || arg == "-h" {
 			fmt.Fprint(stdout, versionUsageText)
 			return 0
+		}
+		if arg == "--password" || arg == "-password" {
+			fmt.Fprintln(stderr, "version does not support --password")
+			return 1
 		}
 	}
 	fmt.Fprintf(stdout, "snapifact %s\n", cliVersion())
