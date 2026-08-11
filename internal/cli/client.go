@@ -47,6 +47,12 @@ const MaxImageContentSize = 8 << 20
 
 const maxImageContentSize = MaxImageContentSize
 
+// MaxPDFContentSize is the fixed backend limit for PDF content bytes.
+const MaxPDFContentSize = 16 << 20
+
+// MaxPDFWireSize is the fixed backend limit for a completed PDF multipart body.
+const MaxPDFWireSize = 17 << 20
+
 // CreateSnapshot sends UTF-8 text content to the server and returns the response.
 // It does NOT retry on timeout — the caller handles that.
 func CreateSnapshot(serverURL, title, content string) (*CreateResponse, error) {
@@ -267,6 +273,78 @@ func CreateBinarySnapshotWithPassword(serverURL, title string, content []byte, f
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read create response: %w", err)
+	}
+	return parseCreateResponse(resp.StatusCode, raw)
+}
+
+// CreatePDFSnapshot sends one bounded PDF multipart request without retrying.
+func CreatePDFSnapshot(serverURL, title string, content []byte, filename, description string, commentsEnabled *bool, password, apiKey string) (*CreateResponse, error) {
+	if len(content) > MaxPDFContentSize {
+		return nil, fmt.Errorf("PDF content exceeds 16 MiB limit")
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	metadataHeader := make(textproto.MIMEHeader)
+	metadataHeader.Set("Content-Disposition", `form-data; name="metadata"`)
+	metadataHeader.Set("Content-Type", "application/json")
+	metadataPart, err := writer.CreatePart(metadataHeader)
+	if err != nil {
+		return nil, fmt.Errorf("create PDF metadata part: %w", err)
+	}
+	metadata := struct {
+		ContentType         string `json:"content_type"`
+		Title               string `json:"title,omitempty"`
+		DescriptionMarkdown string `json:"description_markdown,omitempty"`
+		Filename            string `json:"filename,omitempty"`
+		CommentsEnabled     *bool  `json:"comments_enabled,omitempty"`
+		Password            string `json:"password,omitempty"`
+	}{
+		ContentType:         "pdf",
+		Title:               title,
+		DescriptionMarkdown: description,
+		Filename:            filename,
+		CommentsEnabled:     commentsEnabled,
+		Password:            password,
+	}
+	if err := json.NewEncoder(metadataPart).Encode(metadata); err != nil {
+		return nil, fmt.Errorf("encode PDF metadata: %w", err)
+	}
+
+	contentHeader := make(textproto.MIMEHeader)
+	contentHeader.Set("Content-Disposition", `form-data; name="content"`)
+	contentHeader.Set("Content-Type", "application/pdf")
+	contentPart, err := writer.CreatePart(contentHeader)
+	if err != nil {
+		return nil, fmt.Errorf("create PDF content part: %w", err)
+	}
+	if _, err := contentPart.Write(content); err != nil {
+		return nil, fmt.Errorf("write PDF content: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("close PDF multipart request: %w", err)
+	}
+	if body.Len() > MaxPDFWireSize {
+		return nil, fmt.Errorf("PDF multipart request exceeds 17 MiB limit")
+	}
+
+	req, err := http.NewRequest(http.MethodPost, serverURL+"/v1/snapshots/binary", &body)
+	if err != nil {
+		return nil, fmt.Errorf("create PDF request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if apiKey != "" {
+		req.Header.Set("X-Snapifact-API-Key", apiKey)
+	}
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("create PDF snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read PDF create response: %w", err)
 	}
 	return parseCreateResponse(resp.StatusCode, raw)
 }

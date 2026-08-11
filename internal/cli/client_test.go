@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -313,6 +315,229 @@ func TestCreateBinarySnapshotReturnsStructuredErrorWithoutRetry(t *testing.T) {
 	var response *ErrorResponse
 	if !errors.As(err, &response) || response.Code != "invalid_image" || response.RequestID != "binary-request-id" {
 		t.Fatalf("error = %#v, want structured invalid_image error", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
+	}
+}
+
+func TestCreatePDFSnapshotUsesExactMultipartContract(t *testing.T) {
+	const (
+		apiKey   = "pdf-create-key"
+		password = "pdf-password"
+	)
+	commentsEnabled := true
+	content := []byte{'%', 'P', 'D', 'F', '\n', 0, 0xff, 0x80}
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/snapshots/binary" {
+			t.Fatalf("request = %s %s, want POST /v1/snapshots/binary", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("X-Snapifact-API-Key"); got != apiKey {
+			t.Fatalf("API key = %q, want %q", got, apiKey)
+		}
+		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
+			t.Fatalf("content type = %q, want multipart/form-data with boundary", r.Header.Get("Content-Type"))
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		metadata, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if metadata.FormName() != "metadata" || metadata.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("metadata headers = %v", metadata.Header)
+		}
+		var gotMetadata map[string]any
+		if err := json.NewDecoder(metadata).Decode(&gotMetadata); err != nil {
+			t.Fatal(err)
+		}
+		wantMetadata := map[string]any{
+			"content_type":         "pdf",
+			"title":                "Review",
+			"description_markdown": "Notes",
+			"filename":             "report.pdf",
+			"comments_enabled":     true,
+			"password":             password,
+		}
+		if !reflect.DeepEqual(gotMetadata, wantMetadata) {
+			t.Fatalf("metadata = %#v, want %#v", gotMetadata, wantMetadata)
+		}
+		contentPart, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contentPart.FormName() != "content" || contentPart.FileName() != "" || contentPart.Header.Get("Content-Type") != "application/pdf" {
+			t.Fatalf("content headers = %v", contentPart.Header)
+		}
+		gotContent, err := io.ReadAll(contentPart)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotContent, content) {
+			t.Fatalf("content = %v, want %v", gotContent, content)
+		}
+		if _, err := reader.NextPart(); err != io.EOF {
+			t.Fatalf("multipart parts have trailing data: %v", err)
+		}
+		writeCreateResponse(w)
+	}))
+	defer server.Close()
+
+	response, err := CreatePDFSnapshot(server.URL, "Review", content, "report.pdf", "Notes", &commentsEnabled, password, apiKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.URL == "" || requestCount != 1 {
+		t.Fatalf("response=%+v request count=%d", response, requestCount)
+	}
+}
+
+func TestCreatePDFSnapshotPreservesCommentsPresence(t *testing.T) {
+	for name, commentsEnabled := range map[string]*bool{
+		"absent": nil,
+		"true":   ptr(true),
+		"false":  ptr(false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var gotMetadata map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				part, err := multipart.NewReader(r.Body, params["boundary"]).NextPart()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.NewDecoder(part).Decode(&gotMetadata); err != nil {
+					t.Fatal(err)
+				}
+				writeCreateResponse(w)
+			}))
+			defer server.Close()
+
+			if _, err := CreatePDFSnapshot(server.URL, "", []byte("%PDF"), "", "", commentsEnabled, "", ""); err != nil {
+				t.Fatal(err)
+			}
+			value, present := gotMetadata["comments_enabled"]
+			if commentsEnabled == nil {
+				if present {
+					t.Fatalf("comments_enabled = %#v, want absent", value)
+				}
+				return
+			}
+			if !present || value != *commentsEnabled {
+				t.Fatalf("comments_enabled = %#v (present=%t), want %t", value, present, *commentsEnabled)
+			}
+		})
+	}
+}
+
+func ptr(value bool) *bool {
+	return &value
+}
+
+func TestCreatePDFSnapshotRejectsLocalBoundsBeforeHTTP(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		writeCreateResponse(w)
+	}))
+	defer server.Close()
+
+	if _, err := CreatePDFSnapshot(server.URL, "", make([]byte, MaxPDFContentSize), "", "", nil, "", ""); err != nil {
+		t.Fatalf("exact content boundary = %v", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count after exact content = %d, want 1", requestCount)
+	}
+
+	if _, err := CreatePDFSnapshot(server.URL, "", make([]byte, MaxPDFContentSize+1), "", "", nil, "", ""); err == nil || !strings.Contains(err.Error(), "16 MiB") {
+		t.Fatalf("oversized content error = %v, want 16 MiB limit", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count after oversized content = %d, want 1", requestCount)
+	}
+
+	if _, err := CreatePDFSnapshot(server.URL, strings.Repeat("x", MaxPDFWireSize), nil, "", "", nil, "", ""); err == nil || !strings.Contains(err.Error(), "17 MiB") {
+		t.Fatalf("oversized wire error = %v, want 17 MiB limit", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count after wire bound = %d, want 1", requestCount)
+	}
+}
+
+func TestCreatePDFSnapshotAcceptsExactWireBoundary(t *testing.T) {
+	var requestCount int
+	var lastBodyLength int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastBodyLength = len(body)
+		writeCreateResponse(w)
+	}))
+	defer server.Close()
+
+	if _, err := CreatePDFSnapshot(server.URL, "x", nil, "", "", nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	perTitleByteOverhead := lastBodyLength - 1
+	titleLength := MaxPDFWireSize - perTitleByteOverhead
+	if _, err := CreatePDFSnapshot(server.URL, strings.Repeat("x", titleLength), nil, "", "", nil, "", ""); err != nil {
+		t.Fatalf("exact wire boundary = %v", err)
+	}
+	if lastBodyLength != MaxPDFWireSize {
+		t.Fatalf("wire body length = %d, want %d", lastBodyLength, MaxPDFWireSize)
+	}
+	if _, err := CreatePDFSnapshot(server.URL, strings.Repeat("x", titleLength+1), nil, "", "", nil, "", ""); err == nil || !strings.Contains(err.Error(), "17 MiB") {
+		t.Fatalf("over-boundary error = %v, want 17 MiB limit", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("request count = %d, want 2", requestCount)
+	}
+}
+
+func TestCreatePDFSnapshotReturnsFixedServerErrorWithoutRetry(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		writeContractError(w, http.StatusBadRequest, "invalid_pdf", "PDF failed structural validation", "pdf-request-id")
+	}))
+	defer server.Close()
+
+	_, err := CreatePDFSnapshot(server.URL, "", []byte("not a PDF"), "", "", nil, "", "")
+	var response *ErrorResponse
+	if !errors.As(err, &response) || response.Code != "invalid_pdf" || response.Message != "PDF failed structural validation" || response.RequestID != "pdf-request-id" {
+		t.Fatalf("error = %#v, want fixed invalid_pdf error", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("request count = %d, want 1", requestCount)
+	}
+}
+
+func TestCreatePDFSnapshotDoesNotRetryAmbiguousTransportFailure(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("test server does not support hijacking")
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	if _, err := CreatePDFSnapshot(server.URL, "", []byte("%PDF"), "", "", nil, "", ""); err == nil {
+		t.Fatal("ambiguous transport failure unexpectedly succeeded")
 	}
 	if requestCount != 1 {
 		t.Fatalf("request count = %d, want 1", requestCount)

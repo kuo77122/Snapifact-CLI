@@ -54,6 +54,7 @@ snapifact markdown README.md --title "README review"
 | `snapifact html` | Upload a sandboxed HTML snapshot | One file or stdin |
 | `snapifact csv` | Upload a CSV snapshot | One file or stdin |
 | `snapifact image` | Upload a PNG or JPEG image snapshot | One file or stdin (8 MiB maximum) |
+| `snapifact pdf` | Upload an explicit PDF snapshot | One PDF file or `-` (16 MiB maximum) |
 | `snapifact delete` | Delete a snapshot | Snapshot ID or URL |
 | `snapifact version` | Print the CLI version | — |
 
@@ -91,6 +92,27 @@ SNAPIFACT_API_KEY="$SNAPIFACT_API_KEY" snapifact markdown README.md --password
 
 The key is never sent on delete, view, or raw requests. Image input is limited
 to 8 MiB; the server remains authoritative for image validation.
+
+PDF uploads use a dedicated byte-preserving multipart request. PDF type is never
+inferred from a filename, and the filename is display metadata only:
+
+```sh
+snapifact pdf report.pdf --title "Report review"
+cat report.pdf | snapifact pdf - --comments-enabled=true
+```
+
+PDF options are `--title TEXT`, `--description-file PATH|-`,
+`--comments-enabled=true|false`, and `--password-file PATH|-`. Content is limited
+locally to 16 MiB and the completed multipart body to 17 MiB. The server rejects
+malformed or encrypted/password PDFs and enforces a 50-page maximum plus fixed
+page-box, dimension, and pixel bounds. The PDF command prints only the review
+URL and never retries an ambiguous create request.
+
+PDF validation is structural, not sanitization and not a malware guarantee. The
+server stores the validated original bytes; viewing uses the canvas-only viewer,
+while raw download remains an exact-byte operation. Set `SNAPIFACT_API_KEY` only
+for a keyed PDF create; the key is sent only on that create request and never in
+metadata, output, view, or delete requests.
 
 Content can be read from stdin with `-` or by omitting the path:
 

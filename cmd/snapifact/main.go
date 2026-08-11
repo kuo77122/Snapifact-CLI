@@ -29,6 +29,7 @@ Commands:
   html       upload a sandboxed HTML snapshot
   csv        upload a CSV snapshot
   image      upload a PNG or JPEG image snapshot
+  pdf        upload a PDF snapshot
   delete     delete a snapshot
   version    print the CLI version
 
@@ -130,6 +131,30 @@ Rules:
   cat photo.jpg | snapifact image
 `
 
+const pdfUsageText = `Usage: snapifact pdf [options] <file|->
+
+Arguments:
+  <file|->  exactly one PDF file, or - to read PDF bytes from stdin
+
+Rules:
+  Exactly one file operand is required; PDF behavior is never inferred from a filename.
+  --description-file - and --password-file - read from stdin and cannot be combined with another stdin input.
+  PDF content is limited to 16 MiB and the completed multipart request to 17 MiB.
+  The server rejects malformed, encrypted, or over-limit PDFs after structural validation.
+  Structural validation is not sanitization and provides no malware guarantee.
+  No automatic retry is performed after an ambiguous network failure.
+
+Options:
+  --title <text>                 set the snapshot title
+  --description-file <path|->    read the markdown description from path; - reads it from stdin
+  --comments-enabled=true|false  explicitly set whether comments are enabled
+  --password-file <path|->       read the PDF password from path; - reads it from stdin
+
+Examples:
+  snapifact pdf report.pdf --title "Review"
+  cat report.pdf | snapifact pdf - --comments-enabled=true
+`
+
 const compareUsageText = `Usage: snapifact compare [options] <before-file> <after-file>
 
 Arguments:
@@ -203,6 +228,8 @@ func runWithPasswordReader(args []string, stdin io.Reader, stdout, stderr io.Wri
 		return runUpload("csv", rest, stdin, stdout, stderr, readPassword)
 	case "image":
 		return runImage(rest, stdin, stdout, stderr, readPassword)
+	case "pdf":
+		return runPDF(rest, stdin, stdout, stderr)
 	case "delete":
 		return runDelete(rest, stdout, stderr)
 	case "version":
@@ -225,6 +252,31 @@ func cliVersion() string {
 
 type boolFlag interface {
 	IsBoolFlag() bool
+}
+
+type optionalBoolFlag struct {
+	value bool
+	set   bool
+}
+
+func (f *optionalBoolFlag) String() string {
+	if !f.set {
+		return ""
+	}
+	return fmt.Sprintf("%t", f.value)
+}
+
+func (f *optionalBoolFlag) Set(value string) error {
+	switch value {
+	case "true":
+		f.value = true
+	case "false":
+		f.value = false
+	default:
+		return fmt.Errorf("invalid value %q for --comments-enabled: want true or false", value)
+	}
+	f.set = true
+	return nil
 }
 
 func parseSnapshotArgs(flags *flag.FlagSet, args []string) ([]string, error) {
@@ -479,6 +531,119 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer, readPass
 		return 1
 	}
 	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr, password)
+}
+
+func runPDF(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("pdf", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(flags.Output(), pdfUsageText) }
+	title := flags.String("title", "", "snapshot title")
+	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
+	var commentsEnabled optionalBoolFlag
+	flags.Var(&commentsEnabled, "comments-enabled", "set whether comments are enabled")
+	passwordFile := flags.String("password-file", "", "path to PDF password file (use - for stdin)")
+	operands, err := parseSnapshotArgs(flags, args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	if len(operands) != 1 {
+		fmt.Fprintln(stderr, "usage: snapifact pdf [options] <file|->")
+		return 1
+	}
+
+	contentFromStdin := operands[0] == "-"
+	stdinInputs := 0
+	if contentFromStdin {
+		stdinInputs++
+	}
+	if *descFile == "-" {
+		stdinInputs++
+	}
+	if *passwordFile == "-" {
+		stdinInputs++
+	}
+	if stdinInputs > 1 {
+		fmt.Fprintln(stderr, "error: PDF content, description, and password cannot all be read from stdin")
+		return 1
+	}
+
+	content, err := readPDFContent(operands[0], stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "read PDF: %v\n", err)
+		return 1
+	}
+	description, err := readDescription(*descFile, contentFromStdin, stdin, stderr)
+	if err != nil {
+		return 1
+	}
+	password, err := readPDFPassword(*passwordFile, stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "read PDF password: %v\n", err)
+		return 1
+	}
+
+	var comments *bool
+	if commentsEnabled.set {
+		value := commentsEnabled.value
+		comments = &value
+	}
+	filename := ""
+	if !contentFromStdin {
+		filename = filepath.Base(operands[0])
+	}
+	serverURL := cli.ServerURL()
+	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
+	cli.CleanStaleTokens(tokenDir)
+	apiKey := os.Getenv("SNAPIFACT_API_KEY")
+	response, err := cli.CreatePDFSnapshot(serverURL, *title, content, filename, description, comments, password, apiKey)
+	if err != nil {
+		writeCLIError(stderr, err, password, apiKey)
+		return 1
+	}
+	return finishCreate(serverURL, tokenDir, response, false, stdout, stderr, password)
+}
+
+func readPDFContent(operand string, stdin io.Reader) ([]byte, error) {
+	var reader io.Reader = stdin
+	var file *os.File
+	if operand != "-" {
+		var err error
+		file, err = os.Open(operand)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		reader = file
+	}
+	if reader == nil {
+		reader = strings.NewReader("")
+	}
+	content, err := io.ReadAll(io.LimitReader(reader, cli.MaxPDFContentSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > cli.MaxPDFContentSize {
+		return nil, fmt.Errorf("content exceeds 16 MiB limit")
+	}
+	return content, nil
+}
+
+func readPDFPassword(path string, stdin io.Reader) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if path == "-" {
+		if stdin == nil {
+			return "", errors.New("stdin is unavailable")
+		}
+		data, err := io.ReadAll(stdin)
+		return string(data), err
+	}
+	data, err := os.ReadFile(path)
+	return string(data), err
 }
 
 func readImageContent(operands []string, contentFromStdin bool, stdin io.Reader) ([]byte, error) {

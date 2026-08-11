@@ -9,6 +9,7 @@ import (
 	"flag"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -244,6 +245,147 @@ func TestCreateHelpIncludesPasswordFlag(t *testing.T) {
 				t.Fatalf("help = %q, want --password", stdout.String()+stderr.String())
 			}
 		})
+	}
+}
+
+func TestPDFCommandHelpIsExplicit(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"pdf", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	got := stdout.String() + stderr.String()
+	for _, fragment := range []string{
+		"Usage: snapifact pdf [options] <file|->",
+		"--comments-enabled=true|false",
+		"--password-file <path|->",
+		"16 MiB",
+		"Structural validation is not sanitization",
+	} {
+		if !strings.Contains(got, fragment) {
+			t.Fatalf("pdf help = %q, missing %q", got, fragment)
+		}
+	}
+}
+
+func TestPDFCommandUploadsPathBytesWithoutFilenameInference(t *testing.T) {
+	content := []byte{'%', 'P', 'D', 'F', '\n', 0, 0xff, 0x80}
+	var gotContent []byte
+	var gotMetadata map[string]any
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "multipart/form-data" {
+			t.Fatalf("content type = %q, error = %v", r.Header.Get("Content-Type"), err)
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		metadata, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewDecoder(metadata).Decode(&gotMetadata); err != nil {
+			t.Fatal(err)
+		}
+		contentPart, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotContent, err = io.ReadAll(contentPart)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeCreateResponseWithTierAndURL(w, "", "https://view.test/v/kpm2q6xxyegw5czekhga")
+	}))
+	defer server.Close()
+
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+	srcPath := filepath.Join(t.TempDir(), "not-a-pdf-name.bin")
+	if err := os.WriteFile(srcPath, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"pdf", srcPath}, nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if requestCount != 1 || strings.TrimSpace(stdout.String()) != "https://view.test/v/kpm2q6xxyegw5czekhga" {
+		t.Fatalf("requests=%d stdout=%q", requestCount, stdout.String())
+	}
+	if !bytes.Equal(gotContent, content) {
+		t.Fatalf("content = %v, want %v", gotContent, content)
+	}
+	if gotMetadata["content_type"] != "pdf" || gotMetadata["filename"] != "not-a-pdf-name.bin" {
+		t.Fatalf("metadata = %#v", gotMetadata)
+	}
+}
+
+func TestPDFCommandPreservesOptionalMetadataAndAPIKeyConfinement(t *testing.T) {
+	const apiKey = "pdf-api-key"
+	var gotMetadata map[string]any
+	var gotAPIKey string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("X-Snapifact-API-Key")
+		_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		metadata, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewDecoder(metadata).Decode(&gotMetadata); err != nil {
+			t.Fatal(err)
+		}
+		writeCreateResponseWithTierAndURL(w, "basic", "https://view.test/v/kpm2q6xxyegw5czekhga")
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+	t.Setenv("SNAPIFACT_API_KEY", apiKey)
+
+	root := t.TempDir()
+	contentPath := filepath.Join(root, "document.pdf")
+	passwordPath := filepath.Join(root, "password.txt")
+	if err := os.WriteFile(contentPath, []byte("%PDF\x00bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(passwordPath, []byte("password-from-file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"pdf", contentPath, "--comments-enabled=false", "--password-file", passwordPath}, nil, &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+	}
+	if gotAPIKey != apiKey {
+		t.Fatalf("API key = %q, want %q", gotAPIKey, apiKey)
+	}
+	if gotMetadata["content_type"] != "pdf" || gotMetadata["comments_enabled"] != false || gotMetadata["password"] != "password-from-file" {
+		t.Fatalf("metadata = %#v", gotMetadata)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), apiKey+"\n") {
+		t.Fatal("API key appeared in CLI output")
+	}
+}
+
+func TestPDFCommandRejectsAmbiguousStdinBeforeReadOrPost(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+
+	stdin := &failOnRead{}
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"pdf", "-", "--description-file", "-"}, stdin, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("ambiguous stdin input unexpectedly succeeded")
+	}
+	if stdin.read || requestCount != 0 {
+		t.Fatalf("stdin read=%t request count=%d, want false and 0", stdin.read, requestCount)
 	}
 }
 
@@ -1833,6 +1975,7 @@ func TestGlobalHelpContract(t *testing.T) {
 		"  diff       upload a unified diff snapshot",
 		"  compare    compare two UTF-8 files",
 		"  image      upload a PNG or JPEG image snapshot",
+		"  pdf        upload a PDF snapshot",
 		"stdin",
 		"Options may appear before or after operands",
 		"-- before a dash-prefixed path",
@@ -1953,6 +2096,28 @@ func TestEveryCommandHelpContract(t *testing.T) {
 		}
 	})
 
+	t.Run("pdf", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		if exitCode := run([]string{"pdf", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
+			t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+		}
+		got := stdout.String() + stderr.String()
+		for _, fragment := range []string{
+			"Usage: snapifact pdf [options] <file|->",
+			"Exactly one file operand is required",
+			"PDF content is limited to 16 MiB",
+			"completed multipart request to 17 MiB",
+			"--comments-enabled=true|false",
+			"--password-file <path|->",
+			"malformed, encrypted",
+			"Structural validation is not sanitization",
+		} {
+			if !strings.Contains(got, fragment) {
+				t.Fatalf("pdf help = %q, missing %q", got, fragment)
+			}
+		}
+	})
+
 	t.Run("compare", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		if exitCode := run([]string{"compare", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
@@ -2003,7 +2168,7 @@ func TestHelpHasNoFileStdinTokenOrHTTPSideEffects(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
 
 	commands := [][]string{{"--help"}, {"version", "--help"}, {"delete", "--help"}}
-	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "image"} {
+	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "image", "pdf"} {
 		commands = append(commands, []string{command, "missing-file", "--help"})
 	}
 	for _, args := range commands {
