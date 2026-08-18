@@ -72,7 +72,7 @@ The upload and compare commands support these options:
 - `--password` securely prompts for a password and confirmation from the
   controlling terminal. It requires `SNAPIFACT_API_KEY`; the password is never
   read from stdin, argv, environment, or a file. Passwords must be valid UTF-8
-  and 12–1024 bytes.
+  and at most 1024 bytes.
 
 For image uploads, set the optional `SNAPIFACT_API_KEY` environment variable to
 apply a basic, pro, or admin API key to create requests, including image

@@ -182,7 +182,7 @@ var errPasswordUnavailable = errors.New("unable to read password securely")
 
 var errPasswordMismatch = errors.New("password confirmation does not match")
 
-var errPasswordInvalid = errors.New("password must be valid UTF-8 and 12-1024 bytes")
+var errPasswordInvalid = errors.New("password must be non-empty valid UTF-8 and at most 1024 bytes")
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -815,7 +815,7 @@ func collectPassword(requested bool, reader passwordReader) (string, error) {
 	if password != confirmation {
 		return "", errPasswordMismatch
 	}
-	if !utf8.ValidString(password) || !utf8.ValidString(confirmation) || len([]byte(password)) < 12 || len([]byte(password)) > 1024 {
+	if !utf8.ValidString(password) || !utf8.ValidString(confirmation) || len([]byte(password)) == 0 || len([]byte(password)) > 1024 {
 		return "", errPasswordInvalid
 	}
 	return password, nil
