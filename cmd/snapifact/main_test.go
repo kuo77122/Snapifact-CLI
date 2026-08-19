@@ -415,47 +415,51 @@ func TestPasswordFlagIsUnsupportedOutsideCreateCommands(t *testing.T) {
 }
 
 func TestCollectPasswordValidation(t *testing.T) {
-	valid := strings.Repeat("a", 12)
+	invalidPasswordError := "password must be non-empty valid UTF-8 and at most 1024 bytes"
 	for _, test := range []struct {
-		name       string
-		apiKey     string
-		password   string
-		confirm    string
-		readerErr  error
-		wantErr    error
-		wantSecret string
+		name      string
+		apiKey    string
+		password  string
+		confirm   string
+		readerErr error
+		wantErr   string
+		want      string
 	}{
-		{name: "missing API key", password: valid, confirm: valid, wantErr: errors.New("SNAPIFACT_API_KEY is required with --password")},
-		{name: "reader failure", apiKey: "key", readerErr: errors.New("secret-reader-detail"), wantErr: errPasswordUnavailable},
-		{name: "mismatch", apiKey: "key", password: valid, confirm: valid + "x", wantErr: errPasswordMismatch},
-		{name: "short", apiKey: "key", password: strings.Repeat("a", 11), confirm: strings.Repeat("a", 11), wantErr: errPasswordInvalid},
-		{name: "long", apiKey: "key", password: strings.Repeat("a", 1025), confirm: strings.Repeat("a", 1025), wantErr: errPasswordInvalid},
-		{name: "unicode", apiKey: "key", password: "密码密码密码", confirm: "密码密码密码", wantSecret: "密码密码密码"},
-		{name: "invalid UTF-8", apiKey: "key", password: "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4", confirm: "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8\xf7\xf6\xf5\xf4", wantErr: errPasswordInvalid},
-		{name: "minimum", apiKey: "key", password: valid, confirm: valid, wantSecret: valid},
-		{name: "maximum", apiKey: "key", password: strings.Repeat("b", 1024), confirm: strings.Repeat("b", 1024), wantSecret: strings.Repeat("b", 1024)},
+		{name: "omitted", want: ""},
+		{name: "missing API key", password: "a", confirm: "a", wantErr: "SNAPIFACT_API_KEY is required with --password"},
+		{name: "empty", apiKey: "key", wantErr: invalidPasswordError},
+		{name: "one-byte ASCII", apiKey: "key", password: "a", confirm: "a", want: "a"},
+		{name: "one-character multibyte UTF-8", apiKey: "key", password: "界", confirm: "界", want: "界"},
+		{name: "exactly 1024 bytes", apiKey: "key", password: strings.Repeat("b", 1024), confirm: strings.Repeat("b", 1024), want: strings.Repeat("b", 1024)},
+		{name: "1025 bytes", apiKey: "key", password: strings.Repeat("a", 1025), confirm: strings.Repeat("a", 1025), wantErr: invalidPasswordError},
+		{name: "invalid UTF-8", apiKey: "key", password: "\xff", confirm: "\xff", wantErr: invalidPasswordError},
+		{name: "mismatch", apiKey: "key", password: "a", confirm: "b", wantErr: "password confirmation does not match"},
+		{name: "reader failure", apiKey: "key", readerErr: errors.New("secret-reader-detail"), wantErr: "unable to read password securely"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("SNAPIFACT_API_KEY", test.apiKey)
 			readerCalled := false
-			got, err := collectPassword(true, func() (string, string, error) {
+			got, err := collectPassword(test.name != "omitted", func() (string, string, error) {
 				readerCalled = true
 				return test.password, test.confirm, test.readerErr
 			})
 			if test.apiKey == "" && readerCalled {
 				t.Fatal("reader called without an API key")
 			}
-			if test.wantErr != nil {
-				if err == nil || err.Error() != test.wantErr.Error() {
-					t.Fatalf("error = %v, want %v", err, test.wantErr)
+			if test.wantErr != "" {
+				if err == nil || err.Error() != test.wantErr {
+					t.Fatalf("error = %v, want %q", err, test.wantErr)
 				}
-				if test.password != "" && strings.Contains(err.Error(), test.password) {
+				if len(test.password) > 1 && strings.Contains(err.Error(), test.password) {
 					t.Fatal("password was included in validation error")
 				}
 				return
 			}
-			if err != nil || got != test.wantSecret {
-				t.Fatalf("password = %q, error = %v, want %q", got, err, test.wantSecret)
+			if err != nil || got != test.want {
+				t.Fatalf("password = %q, error = %v, want %q", got, err, test.want)
+			}
+			if test.name == "omitted" && readerCalled {
+				t.Fatal("reader called for omitted password")
 			}
 		})
 	}
@@ -483,6 +487,97 @@ func TestPasswordFailurePrecedesHTTPAndStateMutation(t *testing.T) {
 	}
 	if strings.Contains(stdout.String()+stderr.String(), "reader detail") {
 		t.Fatal("reader error detail was exposed")
+	}
+}
+
+func TestPasswordCommandsAcceptOneCharacterAndRejectLocally(t *testing.T) {
+	root := t.TempDir()
+	beforePath := filepath.Join(root, "before.txt")
+	afterPath := filepath.Join(root, "after.txt")
+	if err := os.WriteFile(beforePath, []byte("before"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(afterPath, []byte("after"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	type passwordCommand struct {
+		name  string
+		args  []string
+		stdin string
+	}
+	commands := []passwordCommand{
+		{name: "diff", args: []string{"diff", "--password"}, stdin: "content"},
+		{name: "compare", args: []string{"compare", beforePath, afterPath, "--password"}},
+		{name: "text", args: []string{"text", "--password"}, stdin: "content"},
+		{name: "markdown", args: []string{"markdown", "--password"}, stdin: "content"},
+		{name: "mermaid", args: []string{"mermaid", "--password"}, stdin: "content"},
+		{name: "html", args: []string{"html", "--password"}, stdin: "content"},
+		{name: "csv", args: []string{"csv", "--password"}, stdin: "content"},
+		{name: "image", args: []string{"image", "--password"}, stdin: "\x89PNG\r\n\x1a\nimage bytes"},
+	}
+
+	for _, command := range commands {
+		t.Run("accept/"+command.name, func(t *testing.T) {
+			const password = "x"
+			var requestCount, passwordFieldCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read request body: %v", err)
+				}
+				requestCount.Add(1)
+				passwordFieldCount.Add(int32(bytes.Count(body, []byte(`"password":"x"`))))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"id": strings.Repeat("a", 32), "url": "https://view.test/v/" + strings.Repeat("a", 32),
+					"expires_at": "2026-08-13T00:00:00Z", "delete_token": strings.Repeat("A", 43), "tier": "basic",
+				})
+			}))
+			defer server.Close()
+			t.Setenv("SNAPIFACT_SERVER", server.URL)
+			t.Setenv("SNAPIFACT_API_KEY", "key")
+			t.Setenv("SNAPIFACT_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+
+			var stdout, stderr bytes.Buffer
+			readerCalls := 0
+			if exitCode := runWithPasswordReader(command.args, strings.NewReader(command.stdin), &stdout, &stderr, func() (string, string, error) {
+				readerCalls++
+				return password, password, nil
+			}); exitCode != 0 {
+				t.Fatalf("exit code = %d, stderr = %s", exitCode, stderr.String())
+			}
+			if readerCalls != 1 || requestCount.Load() != 1 || passwordFieldCount.Load() != 1 {
+				t.Fatalf("reader calls = %d, requests = %d, password fields = %d, want 1, 1, 1", readerCalls, requestCount.Load(), passwordFieldCount.Load())
+			}
+		})
+
+		t.Run("reject/"+command.name, func(t *testing.T) {
+			var requestCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestCount.Add(1)
+				w.WriteHeader(http.StatusCreated)
+			}))
+			defer server.Close()
+			stateDir := filepath.Join(t.TempDir(), "state")
+			t.Setenv("SNAPIFACT_SERVER", server.URL)
+			t.Setenv("SNAPIFACT_API_KEY", "key")
+			t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
+
+			var stdout, stderr bytes.Buffer
+			if exitCode := runWithPasswordReader(command.args, strings.NewReader(command.stdin), &stdout, &stderr, func() (string, string, error) {
+				return "", "", nil
+			}); exitCode == 0 {
+				t.Fatal("empty password unexpectedly succeeded")
+			}
+			if requestCount.Load() != 0 {
+				t.Fatalf("request count = %d, want 0", requestCount.Load())
+			}
+			if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+				t.Fatalf("state directory stat error = %v, want not exists", err)
+			}
+		})
 	}
 }
 
