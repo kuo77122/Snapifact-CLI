@@ -6,8 +6,8 @@
 
 CLI for turning local artifacts into temporary browser links for human review.
 Snapifact is built for AI-agent developers who need to share files, Markdown,
-diffs, diagrams, comparisons, HTML, or CSV with a person without leaving the
-local workflow.
+diffs, diagrams, comparisons, HTML, CSV, or Slides with a person without
+leaving the local workflow.
 
 ## Quick start
 
@@ -41,6 +41,9 @@ snapifact markdown README.md --title "README review"
 - Content is **readable by the operator**. Never upload secrets.
 - Snapshots expire after a **seven-day expiry** and can be deleted earlier
   with the local delete token.
+- New snapshots are **writable by default**: anyone with the link can normally
+  append comments. Use `--comments-enabled=false` at creation time for a
+  permanently read-only snapshot. Omit the flag to keep the server default.
 
 ## Commands
 
@@ -53,9 +56,12 @@ snapifact markdown README.md --title "README review"
 | `snapifact mermaid` | Upload a Mermaid diagram snapshot | One file or stdin |
 | `snapifact html` | Upload a sandboxed HTML snapshot | One file or stdin |
 | `snapifact csv` | Upload a CSV snapshot | One file or stdin |
+| `snapifact slides` | Upload a Slides snapshot | One file or stdin |
 | `snapifact image` | Upload a PNG or JPEG image snapshot | One file or stdin (8 MiB maximum) |
 | `snapifact pdf` | Upload an explicit PDF snapshot | One PDF file or `-` (16 MiB maximum) |
 | `snapifact delete` | Delete a snapshot | Snapshot ID or URL |
+| `snapifact comments close` | Permanently close all comments | Snapshot ID or URL |
+| `snapifact comments delete` | Permanently delete one comment | Snapshot ID or URL and positive message ID |
 | `snapifact version` | Print the CLI version | — |
 
 Global flags are also available:
@@ -69,6 +75,9 @@ The upload and compare commands support these options:
 - `--description-file PATH` reads a Markdown description file. Use `-` to read
   the description from stdin when the artifact itself comes from a file.
 - `--json` prints the complete create response instead of only the review URL.
+- `--comments-enabled=true|false` explicitly controls whether comments are
+  enabled. Omission preserves the server default; `false` is permanently
+  read-only.
 - `--password` securely prompts for a password and confirmation from the
   controlling terminal. It requires `SNAPIFACT_API_KEY`; the password is never
   read from stdin, argv, environment, or a file. Passwords must be valid UTF-8
@@ -101,12 +110,13 @@ snapifact pdf report.pdf --title "Report review"
 cat report.pdf | snapifact pdf - --comments-enabled=true
 ```
 
-PDF options are `--title TEXT`, `--description-file PATH|-`,
+PDF options are `--title TEXT`, `--description-file PATH|-`, `--json`,
 `--comments-enabled=true|false`, and `--password-file PATH|-`. Content is limited
 locally to 16 MiB and the completed multipart body to 17 MiB. The server rejects
 malformed or encrypted/password PDFs and enforces a 50-page maximum plus fixed
 page-box, dimension, and pixel bounds. The PDF command prints only the review
-URL and never retries an ambiguous create request.
+URL by default, or the redacted complete response with `--json`, and never
+retries an ambiguous create request.
 
 PDF validation is structural, not sanitization and not a malware guarantee. The
 server stores the validated original bytes; viewing uses the canvas-only viewer,
@@ -123,6 +133,17 @@ snapifact compare before.txt after.txt --title "Before and after"
 snapifact markdown report.md --description-file notes.md
 snapifact delete https://snapifact.dev/v/<snapshot-id>
 ```
+
+Owner comment administration uses the locally stored snapshot delete token:
+
+```sh
+snapifact comments close <snapshot-id-or-url>
+snapifact comments delete <snapshot-id-or-url> <positive-message-id>
+```
+
+Closing comments and deleting a comment are irreversible owner actions. They
+make one request, never retry automatically, and retain the local delete token
+after success or failure.
 
 Options may appear before, after, or between path operands. Use `--` before a
 path that starts with `-`:

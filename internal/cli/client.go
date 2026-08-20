@@ -98,13 +98,17 @@ func (e *ErrorResponse) Error() string {
 }
 
 // buildCreateBody builds the JSON request body for a single-source create.
-// contentType should be "diff", "text", "markdown", "mermaid", "html", or "csv".
+// contentType should be a supported single-source JSON content type.
 func buildCreateBody(contentType, title, content, filename, description string) io.Reader {
-	return buildCreateBodyWithPassword(contentType, title, content, filename, description, "")
+	return buildCreateBodyWithPasswordAndComments(contentType, title, content, filename, description, "", nil)
 }
 
 func buildCreateBodyWithPassword(contentType, title, content, filename, description, password string) io.Reader {
-	source := map[string]string{"text": content}
+	return buildCreateBodyWithPasswordAndComments(contentType, title, content, filename, description, password, nil)
+}
+
+func buildCreateBodyWithPasswordAndComments(contentType, title, content, filename, description, password string, commentsEnabled *bool) io.Reader {
+	source := map[string]any{"text": content}
 	if filename != "" {
 		source["filename"] = filename
 	}
@@ -120,6 +124,9 @@ func buildCreateBodyWithPassword(contentType, title, content, filename, descript
 	}
 	if password != "" {
 		req["password"] = password
+	}
+	if commentsEnabled != nil {
+		req["comments_enabled"] = *commentsEnabled
 	}
 	var buf bytes.Buffer
 	_ = json.NewEncoder(&buf).Encode(req)
@@ -140,7 +147,13 @@ func CreateSnapshotWithDescriptionAndFilename(serverURL, contentType, title, con
 
 // CreateSnapshotWithDescriptionAndFilenameAndPassword sends a named single-source snapshot with an optional password.
 func CreateSnapshotWithDescriptionAndFilenameAndPassword(serverURL, contentType, title, content, filename, description, password string) (*CreateResponse, error) {
-	body := buildCreateBodyWithPassword(contentType, title, content, filename, description, password)
+	return CreateSnapshotWithDescriptionAndFilenameAndPasswordAndComments(serverURL, contentType, title, content, filename, description, password, nil)
+}
+
+// CreateSnapshotWithDescriptionAndFilenameAndPasswordAndComments sends a named
+// single-source snapshot with optional password and comments metadata.
+func CreateSnapshotWithDescriptionAndFilenameAndPasswordAndComments(serverURL, contentType, title, content, filename, description, password string, commentsEnabled *bool) (*CreateResponse, error) {
+	body := buildCreateBodyWithPasswordAndComments(contentType, title, content, filename, description, password, commentsEnabled)
 	return createSnapshotRequest(serverURL, body)
 }
 
@@ -151,15 +164,25 @@ func CreateCompareSnapshotWithDescription(serverURL, title, before, beforeFilena
 
 // CreateCompareSnapshotWithDescriptionAndPassword sends a compare snapshot with an optional password.
 func CreateCompareSnapshotWithDescriptionAndPassword(serverURL, title, before, beforeFilename, after, afterFilename, description, password string) (*CreateResponse, error) {
-	body := buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFilename, description, password)
+	return CreateCompareSnapshotWithDescriptionAndPasswordAndComments(serverURL, title, before, beforeFilename, after, afterFilename, description, password, nil)
+}
+
+// CreateCompareSnapshotWithDescriptionAndPasswordAndComments sends a compare
+// snapshot with optional password and comments metadata.
+func CreateCompareSnapshotWithDescriptionAndPasswordAndComments(serverURL, title, before, beforeFilename, after, afterFilename, description, password string, commentsEnabled *bool) (*CreateResponse, error) {
+	body := buildCompareBodyWithPasswordAndComments(title, before, beforeFilename, after, afterFilename, description, password, commentsEnabled)
 	return createSnapshotRequest(serverURL, body)
 }
 
 func buildCompareBody(title, before, beforeFilename, after, afterFilename, description string) io.Reader {
-	return buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFilename, description, "")
+	return buildCompareBodyWithPasswordAndComments(title, before, beforeFilename, after, afterFilename, description, "", nil)
 }
 
 func buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFilename, description, password string) io.Reader {
+	return buildCompareBodyWithPasswordAndComments(title, before, beforeFilename, after, afterFilename, description, password, nil)
+}
+
+func buildCompareBodyWithPasswordAndComments(title, before, beforeFilename, after, afterFilename, description, password string, commentsEnabled *bool) io.Reader {
 	content := map[string]any{
 		"before": map[string]string{"text": before, "filename": beforeFilename},
 		"after":  map[string]string{"text": after, "filename": afterFilename},
@@ -173,6 +196,9 @@ func buildCompareBodyWithPassword(title, before, beforeFilename, after, afterFil
 	}
 	if password != "" {
 		req["password"] = password
+	}
+	if commentsEnabled != nil {
+		req["comments_enabled"] = *commentsEnabled
 	}
 	var buf bytes.Buffer
 	_ = json.NewEncoder(&buf).Encode(req)
@@ -210,6 +236,12 @@ func CreateBinarySnapshot(serverURL, title string, content []byte, filename, des
 
 // CreateBinarySnapshotWithPassword sends an image with optional password metadata.
 func CreateBinarySnapshotWithPassword(serverURL, title string, content []byte, filename, description, password string) (*CreateResponse, error) {
+	return CreateBinarySnapshotWithPasswordAndComments(serverURL, title, content, filename, description, password, nil)
+}
+
+// CreateBinarySnapshotWithPasswordAndComments sends image metadata with
+// optional password and comments fields.
+func CreateBinarySnapshotWithPasswordAndComments(serverURL, title string, content []byte, filename, description, password string, commentsEnabled *bool) (*CreateResponse, error) {
 	if len(content) > maxImageContentSize {
 		return nil, fmt.Errorf("image content exceeds 8 MiB limit")
 	}
@@ -223,7 +255,7 @@ func CreateBinarySnapshotWithPassword(serverURL, title string, content []byte, f
 	if err != nil {
 		return nil, fmt.Errorf("create metadata part: %w", err)
 	}
-	metadataBody := map[string]string{"content_type": "image"}
+	metadataBody := map[string]any{"content_type": "image"}
 	if title != "" {
 		metadataBody["title"] = title
 	}
@@ -235,6 +267,9 @@ func CreateBinarySnapshotWithPassword(serverURL, title string, content []byte, f
 	}
 	if password != "" {
 		metadataBody["password"] = password
+	}
+	if commentsEnabled != nil {
+		metadataBody["comments_enabled"] = *commentsEnabled
 	}
 	if err := json.NewEncoder(metadata).Encode(metadataBody); err != nil {
 		return nil, fmt.Errorf("encode image metadata: %w", err)
@@ -347,6 +382,34 @@ func CreatePDFSnapshot(serverURL, title string, content []byte, filename, descri
 		return nil, fmt.Errorf("read PDF create response: %w", err)
 	}
 	return parseCreateResponse(resp.StatusCode, raw)
+}
+
+// CloseComments permanently closes comments for a snapshot using its delete token.
+func CloseComments(serverURL, id, token string) error {
+	return ownerCommentRequest(http.MethodPost, serverURL+"/v1/snapshots/"+id+"/comments/close", token)
+}
+
+// DeleteComment permanently deletes one comment using the snapshot delete token.
+func DeleteComment(serverURL, id, messageID, token string) error {
+	return ownerCommentRequest(http.MethodDelete, serverURL+"/v1/snapshots/"+id+"/comments/"+messageID, token)
+}
+
+func ownerCommentRequest(method, url, token string) error {
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		return fmt.Errorf("create comment request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("comment request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	return parseError(raw)
 }
 
 func applyCreateHeaders(req *http.Request) {
