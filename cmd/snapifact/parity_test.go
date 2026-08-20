@@ -172,6 +172,115 @@ func TestCommentsCommandsValidateBeforeTokenReadAndRetainToken(t *testing.T) {
 	}
 }
 
+func TestCanonicalPositiveMessageIDUsesSignedInt64Range(t *testing.T) {
+	for value, want := range map[string]bool{
+		"1":                    true,
+		"9223372036854775807":  true,
+		"0":                    false,
+		"01":                   false,
+		"-1":                   false,
+		"9223372036854775808":  false,
+		"18446744073709551615": false,
+	} {
+		if got := canonicalPositiveMessageID(value); got != want {
+			t.Fatalf("canonicalPositiveMessageID(%q) = %t, want %t", value, got, want)
+		}
+	}
+}
+
+func TestCommentsMissingTokenDoesNotRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"comments", "close", "kpm2q6xxyegw5czekhga"}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("missing token unexpectedly succeeded")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("requests = %d, want 0", requests.Load())
+	}
+}
+
+func TestCommentsStructuredErrorRedactsTokenAndRetainsIt(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"code": "forbidden", "message": "server echoed " + token, "request_id": "comment-request-id",
+		})
+	}))
+	defer server.Close()
+	stateDir := t.TempDir()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
+	id := "kpm2q6xxyegw5czekhga"
+	tokenDir := filepath.Join(stateDir, "snapifact", "tokens")
+	if err := os.MkdirAll(tokenDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tokenDir, id), []byte(token), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"comments", "close", id}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("server error unexpectedly succeeded")
+	}
+	if !strings.Contains(stderr.String(), "forbidden") || !strings.Contains(stderr.String(), "comment-request-id") || strings.Contains(stderr.String(), token) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(tokenDir, id)); err != nil {
+		t.Fatalf("token was not retained: %v", err)
+	}
+}
+
+func TestCommentsAmbiguousFailureMakesOneAttemptAndRetainsToken(t *testing.T) {
+	const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("test server does not support hijacking")
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	stateDir := t.TempDir()
+	t.Setenv("SNAPIFACT_SERVER", server.URL)
+	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
+	id := "kpm2q6xxyegw5czekhga"
+	tokenDir := filepath.Join(stateDir, "snapifact", "tokens")
+	if err := os.MkdirAll(tokenDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tokenDir, id), []byte(token), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"comments", "close", id}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("ambiguous failure unexpectedly succeeded")
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("requests = %d, want 1", requests.Load())
+	}
+	if _, err := os.Stat(filepath.Join(tokenDir, id)); err != nil {
+		t.Fatalf("token was not retained: %v", err)
+	}
+}
+
 func TestCommentsHelpDisclosesIrreversibleOwnerActions(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exitCode := run([]string{"comments", "--help"}, nil, &stdout, &stderr); exitCode != 0 {
@@ -182,5 +291,15 @@ func TestCommentsHelpDisclosesIrreversibleOwnerActions(t *testing.T) {
 		if !strings.Contains(strings.ToLower(got), fragment) {
 			t.Fatalf("help = %q, missing %q", got, fragment)
 		}
+	}
+}
+
+func TestCommentsDeleteUsageIncludesMessageID(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exitCode := run([]string{"comments", "delete", "kpm2q6xxyegw5czekhga"}, nil, &stdout, &stderr); exitCode == 0 {
+		t.Fatal("missing message ID unexpectedly succeeded")
+	}
+	if !strings.Contains(stderr.String(), "<message-id>") {
+		t.Fatalf("stderr = %q, want message-id usage", stderr.String())
 	}
 }

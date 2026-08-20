@@ -979,7 +979,11 @@ func runCommentAction(action string, args []string, stderr io.Writer) int {
 		wantArgs = 2
 	}
 	if flags.NArg() != wantArgs {
-		fmt.Fprintln(stderr, "usage: snapifact comments "+action+" <id-or-url>")
+		usage := "usage: snapifact comments " + action + " <id-or-url>"
+		if action == "delete" {
+			usage += " <message-id>"
+		}
+		fmt.Fprintln(stderr, usage)
 		return 1
 	}
 
@@ -1018,8 +1022,8 @@ func runCommentAction(action string, args []string, stderr io.Writer) int {
 }
 
 func canonicalPositiveMessageID(value string) bool {
-	parsed, err := strconv.ParseUint(value, 10, 64)
-	return err == nil && parsed > 0 && strconv.FormatUint(parsed, 10) == value
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return err == nil && parsed > 0 && strconv.FormatInt(parsed, 10) == value
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) int {

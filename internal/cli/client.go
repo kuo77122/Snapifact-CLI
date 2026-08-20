@@ -405,7 +405,7 @@ func ownerCommentRequest(method, url, token string) error {
 		return fmt.Errorf("comment request: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+	if resp.StatusCode == http.StatusNoContent {
 		return nil
 	}
 	raw, _ := io.ReadAll(resp.Body)

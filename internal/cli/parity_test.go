@@ -123,3 +123,46 @@ func TestOwnerCommentRequestsUseDeleteTokenOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestOwnerCommentRequestsAcceptOnlyNoContent(t *testing.T) {
+	for _, status := range []int{http.StatusNoContent, http.StatusOK, http.StatusCreated} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			err := CloseComments(server.URL, "kpm2q6xxyegw5czekhga", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+			if status == http.StatusNoContent && err != nil {
+				t.Fatalf("204 error = %v", err)
+			}
+			if status != http.StatusNoContent && err == nil {
+				t.Fatalf("status %d unexpectedly succeeded", status)
+			}
+		})
+	}
+}
+
+func TestOwnerCommentTransportFailureMakesOneAttempt(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("test server does not support hijacking")
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	if err := CloseComments(server.URL, "kpm2q6xxyegw5czekhga", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); err == nil {
+		t.Fatal("ambiguous transport failure unexpectedly succeeded")
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+}
