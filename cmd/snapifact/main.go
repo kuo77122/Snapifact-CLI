@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -28,9 +29,11 @@ Commands:
   mermaid    upload a Mermaid diagram snapshot
   html       upload a sandboxed HTML snapshot
   csv        upload a CSV snapshot
+  slides     upload a Slides snapshot
   image      upload a PNG or JPEG image snapshot
   pdf        upload a PDF snapshot
   delete     delete a snapshot
+  comments   close or delete comments as the snapshot owner
   version    print the CLI version
 
 Rules:
@@ -45,7 +48,11 @@ Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
   --json                         output the full JSON response instead of only the snapshot URL
+  --comments-enabled=true|false  explicitly set whether comments are enabled; omission keeps the server default
   SNAPIFACT_API_KEY              optional API key for create requests; required with --password
+
+  New snapshots are writable by default. Explicit --comments-enabled=false makes them permanently read-only.
+  Comment close/delete owner actions are irreversible.
 
   --description-file - reads the description from stdin and cannot be combined with content also read from stdin.
 
@@ -54,13 +61,17 @@ Examples:
   snapifact text path/to/file.txt --title "Review" --json
   snapifact compare before.txt after.txt
   snapifact delete kpm2q6xxyegw5czekhga
+  snapifact comments close kpm2q6xxyegw5czekhga
 `
 
 const sharedOptionsText = `Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
   --json                         output the full JSON response instead of only the snapshot URL
+  --comments-enabled=true|false  explicitly set whether comments are enabled; omission keeps the server default
   --password                     prompt securely for a password and confirmation
+
+  New snapshots are writable by default; --comments-enabled=false is permanently read-only.
 `
 
 const versionUsageText = `Usage: snapifact version
@@ -147,12 +158,24 @@ Rules:
 Options:
   --title <text>                 set the snapshot title
   --description-file <path|->    read the markdown description from path; - reads it from stdin
+  --json                         output the full JSON response instead of only the snapshot URL
   --comments-enabled=true|false  explicitly set whether comments are enabled
   --password-file <path|->       read the PDF password from path; - reads it from stdin
 
 Examples:
   snapifact pdf report.pdf --title "Review"
   cat report.pdf | snapifact pdf - --comments-enabled=true
+`
+
+const commentsUsageText = `Usage: snapifact comments <close|delete> ...
+
+Commands:
+  snapifact comments close <id-or-url>              permanently close all comments on a snapshot
+  snapifact comments delete <id-or-url> <message-id> permanently delete one comment
+
+Rules:
+  Owner actions use the locally stored snapshot delete token.
+  Comment close and delete actions are irreversible and are never retried.
 `
 
 const compareUsageText = `Usage: snapifact compare [options] <before-file> <after-file>
@@ -226,12 +249,16 @@ func runWithPasswordReader(args []string, stdin io.Reader, stdout, stderr io.Wri
 		return runUpload("html", rest, stdin, stdout, stderr, readPassword)
 	case "csv":
 		return runUpload("csv", rest, stdin, stdout, stderr, readPassword)
+	case "slides":
+		return runUpload("slides", rest, stdin, stdout, stderr, readPassword)
 	case "image":
 		return runImage(rest, stdin, stdout, stderr, readPassword)
 	case "pdf":
 		return runPDF(rest, stdin, stdout, stderr)
 	case "delete":
 		return runDelete(rest, stdout, stderr)
+	case "comments":
+		return runComments(rest, stdout, stderr)
 	case "version":
 		return runVersion(rest, stdout, stderr)
 	default:
@@ -353,6 +380,8 @@ func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer, readPa
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
 	passwordRequested := flags.Bool("password", false, "prompt securely for a password and confirmation")
+	var commentsEnabled optionalBoolFlag
+	flags.Var(&commentsEnabled, "comments-enabled", "set whether comments are enabled")
 	operands, err := parseSnapshotArgs(flags, args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -384,10 +413,15 @@ func runCompare(args []string, stdin io.Reader, stdout, stderr io.Writer, readPa
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	var comments *bool
+	if commentsEnabled.set {
+		value := commentsEnabled.value
+		comments = &value
+	}
 	serverURL := cli.ServerURL()
 	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
 	cli.CleanStaleTokens(tokenDir)
-	response, err := cli.CreateCompareSnapshotWithDescriptionAndPassword(serverURL, *title, string(before), filepath.Base(beforePath), string(after), filepath.Base(afterPath), description, password)
+	response, err := cli.CreateCompareSnapshotWithDescriptionAndPasswordAndComments(serverURL, *title, string(before), filepath.Base(beforePath), string(after), filepath.Base(afterPath), description, password, comments)
 	if err != nil {
 		writeCLIError(stderr, err, password)
 		return 1
@@ -404,6 +438,8 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
 	passwordRequested := flags.Bool("password", false, "prompt securely for a password and confirmation")
+	var commentsEnabled optionalBoolFlag
+	flags.Var(&commentsEnabled, "comments-enabled", "set whether comments are enabled")
 
 	operands, err := parseSnapshotArgs(flags, args)
 	if err != nil {
@@ -455,6 +491,11 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	var comments *bool
+	if commentsEnabled.set {
+		value := commentsEnabled.value
+		comments = &value
+	}
 
 	serverURL := cli.ServerURL()
 	stateDir := os.Getenv("SNAPIFACT_STATE_DIR")
@@ -465,10 +506,10 @@ func runUpload(contentType string, args []string, stdin io.Reader, stdout, stder
 
 	// Send to server
 	filename := ""
-	if contentType == "csv" && !contentFromStdin {
+	if !contentFromStdin {
 		filename = filepath.Base(operands[0])
 	}
-	resp, err := cli.CreateSnapshotWithDescriptionAndFilenameAndPassword(serverURL, contentType, *title, content, filename, description, password)
+	resp, err := cli.CreateSnapshotWithDescriptionAndFilenameAndPasswordAndComments(serverURL, contentType, *title, content, filename, description, password, comments)
 	if err != nil {
 		writeCLIError(stderr, err, password)
 		return 1
@@ -484,6 +525,8 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer, readPass
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
 	passwordRequested := flags.Bool("password", false, "prompt securely for a password and confirmation")
+	var commentsEnabled optionalBoolFlag
+	flags.Var(&commentsEnabled, "comments-enabled", "set whether comments are enabled")
 
 	operands, err := parseSnapshotArgs(flags, args)
 	if err != nil {
@@ -517,6 +560,11 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer, readPass
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	var comments *bool
+	if commentsEnabled.set {
+		value := commentsEnabled.value
+		comments = &value
+	}
 
 	serverURL := cli.ServerURL()
 	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
@@ -525,7 +573,7 @@ func runImage(args []string, stdin io.Reader, stdout, stderr io.Writer, readPass
 	if !contentFromStdin {
 		filename = filepath.Base(operands[0])
 	}
-	response, err := cli.CreateBinarySnapshotWithPassword(serverURL, *title, content, filename, description, password)
+	response, err := cli.CreateBinarySnapshotWithPasswordAndComments(serverURL, *title, content, filename, description, password, comments)
 	if err != nil {
 		writeCLIError(stderr, err, password)
 		return 1
@@ -537,6 +585,7 @@ func runPDF(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("pdf", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(flags.Output(), pdfUsageText) }
+	jsonMode := flags.Bool("json", false, "output full JSON response")
 	title := flags.String("title", "", "snapshot title")
 	descFile := flags.String("description-file", "", "path to markdown description file (use - for stdin)")
 	var commentsEnabled optionalBoolFlag
@@ -603,7 +652,7 @@ func runPDF(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		writeCLIError(stderr, err, password, apiKey)
 		return 1
 	}
-	return finishCreate(serverURL, tokenDir, response, false, stdout, stderr, password)
+	return finishCreate(serverURL, tokenDir, response, *jsonMode, stdout, stderr, password)
 }
 
 func readPDFContent(operand string, stdin io.Reader) ([]byte, error) {
@@ -898,6 +947,79 @@ func runDelete(args []string, stdout, stderr io.Writer) int {
 	// On success (204) or already gone (404), remove local token
 	_ = cli.RemoveToken(tokenDir, id)
 	return 0
+}
+
+func runComments(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
+		fmt.Fprint(stdout, commentsUsageText)
+		return 0
+	}
+	subcommand := args[0]
+	switch subcommand {
+	case "close", "delete":
+		return runCommentAction(subcommand, args[1:], stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown comments command: %s\n\n%s", subcommand, commentsUsageText)
+		return 1
+	}
+}
+
+func runCommentAction(action string, args []string, stderr io.Writer) int {
+	flags := flag.NewFlagSet("comments "+action, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	flags.Usage = func() { fmt.Fprint(flags.Output(), commentsUsageText) }
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 1
+	}
+	wantArgs := 1
+	if action == "delete" {
+		wantArgs = 2
+	}
+	if flags.NArg() != wantArgs {
+		fmt.Fprintln(stderr, "usage: snapifact comments "+action+" <id-or-url>")
+		return 1
+	}
+
+	id := extractID(flags.Arg(0))
+	if id == "" {
+		fmt.Fprintf(stderr, "invalid snapshot ID or URL: %s\n", flags.Arg(0))
+		return 1
+	}
+	messageID := ""
+	if action == "delete" {
+		messageID = flags.Arg(1)
+		if !canonicalPositiveMessageID(messageID) {
+			fmt.Fprintf(stderr, "invalid message ID: %s\n", messageID)
+			return 1
+		}
+	}
+
+	tokenDir := cli.TokenDir(os.Getenv("SNAPIFACT_STATE_DIR"))
+	token, err := cli.ReadToken(tokenDir, id)
+	if err != nil {
+		writeCLIError(stderr, err)
+		return 1
+	}
+
+	serverURL := cli.ServerURL()
+	if action == "close" {
+		err = cli.CloseComments(serverURL, id, token)
+	} else {
+		err = cli.DeleteComment(serverURL, id, messageID, token)
+	}
+	if err != nil {
+		writeCLIError(stderr, err, token)
+		return 1
+	}
+	return 0
+}
+
+func canonicalPositiveMessageID(value string) bool {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && parsed > 0 && strconv.FormatUint(parsed, 10) == value
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) int {

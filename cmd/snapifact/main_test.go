@@ -235,7 +235,7 @@ func TestTextFromPathDefaultOutput(t *testing.T) {
 }
 
 func TestCreateHelpIncludesPasswordFlag(t *testing.T) {
-	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "image"} {
+	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "slides", "image"} {
 		t.Run(command, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if exitCode := run([]string{command, "--help"}, nil, &stdout, &stderr); exitCode != 0 {
@@ -1733,7 +1733,7 @@ func equalStrings(got, want []string) bool {
 }
 
 func TestSharedUploadsAcceptTrailingAndInterspersedOptions(t *testing.T) {
-	for _, command := range []string{"diff", "text", "markdown", "mermaid", "html", "csv"} {
+	for _, command := range []string{"diff", "text", "markdown", "mermaid", "html", "csv", "slides"} {
 		for _, ordering := range []string{"trailing", "interspersed"} {
 			t.Run(command+"/"+ordering, func(t *testing.T) {
 				_, server, cleanup := testHarness(t)
@@ -1769,10 +1769,7 @@ func TestSharedUploadsAcceptTrailingAndInterspersedOptions(t *testing.T) {
 				if err := json.Unmarshal([]byte(server.LastCreateBody()), &request); err != nil {
 					t.Fatal(err)
 				}
-				wantFilename := ""
-				if command == "csv" {
-					wantFilename = "content"
-				}
+				wantFilename := "content"
 				if request.ContentType != command || request.Title != title || request.Content.Text != "shared upload content" || request.Content.Filename != wantFilename || server.CreateCount() != 1 {
 					t.Fatalf("request = %+v, create count = %d", request, server.CreateCount())
 				}
@@ -2071,12 +2068,15 @@ func TestGlobalHelpContract(t *testing.T) {
 		"  compare    compare two UTF-8 files",
 		"  image      upload a PNG or JPEG image snapshot",
 		"  pdf        upload a PDF snapshot",
+		"  slides     upload a Slides snapshot",
+		"  comments   close or delete comments as the snapshot owner",
 		"stdin",
 		"Options may appear before or after operands",
 		"-- before a dash-prefixed path",
 		"--title <text>",
 		"--description-file <path|->",
 		"--json",
+		"--comments-enabled=true|false",
 		"--description-file - reads the description from stdin",
 		"cannot be combined with content also read from stdin",
 		"snapifact compare before.txt after.txt",
@@ -2263,7 +2263,7 @@ func TestHelpHasNoFileStdinTokenOrHTTPSideEffects(t *testing.T) {
 	t.Setenv("SNAPIFACT_STATE_DIR", stateDir)
 
 	commands := [][]string{{"--help"}, {"version", "--help"}, {"delete", "--help"}}
-	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "image", "pdf"} {
+	for _, command := range []string{"diff", "compare", "text", "markdown", "mermaid", "html", "csv", "slides", "image", "pdf"} {
 		commands = append(commands, []string{command, "missing-file", "--help"})
 	}
 	for _, args := range commands {
